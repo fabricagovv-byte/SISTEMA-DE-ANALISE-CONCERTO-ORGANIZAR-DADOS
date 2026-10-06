@@ -160,3 +160,45 @@ def redigir_parecer(resumo: dict) -> str:
         f"{json.dumps(resumo, ensure_ascii=False, indent=1, default=str)}"
     )
     return _chamar(cliente, mensagem, esforco="medium")
+
+
+ESQUEMA_DOCUMENTO = {
+    "type": "object",
+    "properties": {
+        "tipo": {"type": "string"},
+        "orgao": {"type": "string"},
+        "objeto": {"type": "string"},
+        "resumo": {"type": "string"},
+        "pontos_de_atencao": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["tipo", "orgao", "objeto", "resumo", "pontos_de_atencao"],
+    "additionalProperties": False,
+}
+
+LIMITE_CARACTERES_DOCUMENTO = 400_000
+
+
+def analisar_documento(nome: str, texto_anonimizado: str, tipos_validos: list[str]) -> dict:
+    """Classifica e resume um documento. Recebe o texto JÁ anonimizado (sem CPF, RG, contatos...).
+
+    Documentos acima de LIMITE_CARACTERES_DOCUMENTO são enviados em parte e isso é
+    sinalizado no retorno (chave "_truncado").
+    """
+    import anthropic
+
+    truncado = len(texto_anonimizado) > LIMITE_CARACTERES_DOCUMENTO
+    texto = texto_anonimizado[:LIMITE_CARACTERES_DOCUMENTO]
+    cliente = anthropic.Anthropic()
+    mensagem = (
+        f"Documento público '{nome}' (dados pessoais já substituídos por marcadores como [CPF]).\n"
+        f"1. tipo: escolha um de {tipos_validos} ou 'Outro'.\n"
+        "2. orgao: órgão emissor.\n3. objeto: objeto/assunto em uma frase.\n"
+        "4. resumo: 3 a 5 frases com o essencial (partes, valores, prazos, decisões).\n"
+        "5. pontos_de_atencao: irregularidades aparentes, prazos vencidos, valores divergentes, "
+        "referências a documentos que deveriam existir (aditivos, anexos, empenhos) — lista vazia se nada.\n"
+        + ("(Atenção: apenas o início do documento foi enviado por ser muito longo.)\n" if truncado else "")
+        + f"\n<documento>\n{texto}\n</documento>"
+    )
+    resultado = json.loads(_chamar(cliente, mensagem, ESQUEMA_DOCUMENTO, esforco="low"))
+    resultado["_truncado"] = truncado
+    return resultado

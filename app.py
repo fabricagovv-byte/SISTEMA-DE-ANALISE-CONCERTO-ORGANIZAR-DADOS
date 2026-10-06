@@ -3,19 +3,17 @@
 Executar:  streamlit run app.py
 """
 
-import io
-import zipfile
-
 import streamlit as st
 
-from agente import executar, gerar_excel
+from agente import executar, gerar_excel, gerar_pacote_zip
 from agente.agente_ia import ia_disponivel
 
 st.set_page_config(page_title="Agente de Dados do Governo", page_icon="🏛️", layout="wide")
 st.title("🏛️ Agente de Organização e Sincronização de Dados")
 st.caption(
-    "Suba planilhas e arquivos de bases governamentais (CSV, Excel, JSON). O agente padroniza colunas, "
-    "valida CPF/CNPJ/CEP/UF, converte datas e valores em R$, remove duplicatas e cruza as bases."
+    "Suba documentos públicos (PDF, Word, HTML, TXT) e bases de dados (CSV, Excel, JSON). O agente organiza "
+    "os documentos em dossiês, encontra a continuação entre eles e o que está faltando, detecta dados pessoais "
+    "e sensíveis (LGPD) gerando versões anonimizadas, limpa as tabelas e cruza tudo."
 )
 
 with st.sidebar:
@@ -35,8 +33,8 @@ with st.sidebar:
     ).strip() or None
 
 arquivos = st.file_uploader(
-    "Arquivos de dados",
-    type=["csv", "txt", "xlsx", "xlsm", "xls", "json"],
+    "Documentos e arquivos de dados",
+    type=["pdf", "docx", "html", "htm", "txt", "md", "rtf", "csv", "xlsx", "xlsm", "xls", "json"],
     accept_multiple_files=True,
 )
 
@@ -58,42 +56,66 @@ if arquivos and st.button("▶️ Processar", type="primary"):
 resultado = st.session_state.get("resultado")
 if resultado:
     sinc = resultado.sincronizacao
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Tabelas", len(resultado.tabelas))
-    c2.metric("Registros consolidados", len(sinc.consolidado))
-    c3.metric("Problemas encontrados", len(resultado.problemas))
-    c4.metric("Divergências entre bases", len(sinc.divergencias))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Documentos", len(resultado.documentos))
+    c2.metric("Dossiês", resultado.dossies["dossie"].nunique() if len(resultado.dossies) else 0)
+    c3.metric("Lacunas (o que falta)", len(resultado.lacunas))
+    c4.metric("Arquivos risco ALTO (LGPD)", int((resultado.risco["risco"] == "ALTO").sum()) if len(resultado.risco) else 0)
+    c5.metric("Registros consolidados", len(sinc.consolidado))
 
-    st.download_button(
+    b1, b2 = st.columns(2)
+    b1.download_button(
         "⬇️ Baixar planilha organizada (Excel)",
         data=gerar_excel(resultado),
         file_name="resultado_organizado.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
-    pacote = io.BytesIO()
-    with zipfile.ZipFile(pacote, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("parecer.md", resultado.parecer)
-        if len(sinc.consolidado):
-            z.writestr("consolidado.csv", sinc.consolidado.to_csv(index=False, sep=";").encode("utf-8-sig"))
-        for t in resultado.tabelas:
-            z.writestr(f"limpo_{t.nome}.csv", t.dados.to_csv(index=False, sep=";").encode("utf-8-sig"))
-    st.download_button("⬇️ Baixar CSVs + parecer (ZIP)", data=pacote.getvalue(), file_name="resultado.zip")
+    b2.download_button(
+        "⬇️ Baixar pacote: CSVs + documentos e tabelas ANONIMIZADOS (ZIP)",
+        data=gerar_pacote_zip(resultado),
+        file_name="resultado.zip",
+    )
 
-    abas = st.tabs(["Parecer", "Consolidado", "Cobertura", "Divergências", "Problemas", "Dicionário", "Tabelas limpas"])
+    abas = st.tabs([
+        "Parecer", "Documentos", "Dossiês e continuação", "Dados sensíveis (LGPD)",
+        "Consolidado", "Divergências", "Problemas", "Dicionário", "Tabelas limpas",
+    ])
     with abas[0]:
         st.markdown(resultado.parecer)
     with abas[1]:
-        st.dataframe(sinc.consolidado, width="stretch")
+        st.dataframe(resultado.fichas, width="stretch")
+        for doc in resultado.documentos:
+            with st.expander(f"📄 {doc.nome}"):
+                anonimo = st.toggle("Mostrar versão anonimizada", value=True, key=f"anon_{doc.nome}")
+                texto = resultado.documentos_anonimizados[doc.nome] if anonimo else doc.texto
+                st.text(texto[:20000] + ("\n[...]" if len(texto) > 20000 else ""))
     with abas[2]:
-        st.dataframe(sinc.cobertura, width="stretch")
+        st.subheader("Dossiês (documentos ligados, em ordem)")
+        st.dataframe(resultado.dossies, width="stretch")
+        st.subheader("O que falta / próxima continuação esperada")
+        st.dataframe(resultado.lacunas, width="stretch")
+        st.subheader("Por que os documentos foram ligados")
+        st.dataframe(resultado.vinculos, width="stretch")
+        if len(resultado.cruzamento_docs_dados):
+            st.subheader("CPF/CNPJ dos documentos encontrados nas tabelas")
+            st.dataframe(resultado.cruzamento_docs_dados, width="stretch")
     with abas[3]:
-        st.dataframe(sinc.divergencias, width="stretch")
+        st.subheader("Risco por arquivo")
+        st.dataframe(resultado.risco, width="stretch")
+        st.subheader("Ocorrências (valores mascarados)")
+        st.dataframe(resultado.sensiveis, width="stretch")
     with abas[4]:
-        st.dataframe(resultado.problemas, width="stretch")
+        st.dataframe(sinc.consolidado, width="stretch")
+        st.caption("Cobertura por base")
+        st.dataframe(sinc.cobertura, width="stretch")
     with abas[5]:
-        st.dataframe(resultado.dicionario, width="stretch")
+        st.dataframe(sinc.divergencias, width="stretch")
     with abas[6]:
+        st.dataframe(resultado.problemas, width="stretch")
+    with abas[7]:
+        st.dataframe(resultado.dicionario, width="stretch")
+    with abas[8]:
         for t in resultado.tabelas:
             with st.expander(f"{t.nome} — {len(t.dados)} linhas"):
                 if t.nome in resultado.descricoes:
