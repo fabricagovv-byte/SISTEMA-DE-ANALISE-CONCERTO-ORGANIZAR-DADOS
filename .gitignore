@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+resultado_organizado.xlsx
+.pytest_cache/
