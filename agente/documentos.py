@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-EXTENSOES_DOCUMENTO = {".pdf", ".docx", ".html", ".htm", ".md", ".rtf"}
+EXTENSOES_DOCUMENTO = {".pdf", ".docx", ".html", ".htm", ".md", ".rtf", ".log", ".eml"}
 
 
 @dataclass
@@ -97,6 +97,24 @@ def _ler_rtf(conteudo: bytes) -> Documento:
     return Documento("", texto, [texto])
 
 
+def _ler_eml(conteudo: bytes) -> Documento:
+    from email import policy
+    from email.parser import BytesParser
+
+    msg = BytesParser(policy=policy.default).parsebytes(conteudo)
+    cabecalho = "\n".join(f"{k}: {msg[k]}" for k in ("From", "To", "Cc", "Subject", "Date") if msg[k])
+    corpo = msg.get_body(preferencelist=("plain", "html"))
+    texto = corpo.get_content() if corpo is not None else ""
+    if corpo is not None and corpo.get_content_type() == "text/html":
+        from bs4 import BeautifulSoup
+        texto = BeautifulSoup(texto, "html.parser").get_text("\n", strip=True)
+    anexos = [a.get_filename() for a in msg.iter_attachments() if a.get_filename()]
+    doc = Documento("", f"{cabecalho}\n\n{texto}", [f"{cabecalho}\n\n{texto}"])
+    if anexos:
+        doc.avisos.append("e-mail com anexo(s) não processado(s): " + ", ".join(anexos))
+    return doc
+
+
 def ler_documento(nome: str, conteudo: bytes) -> Documento:
     extensao = Path(nome).suffix.lower()
     if extensao == ".pdf":
@@ -107,6 +125,8 @@ def ler_documento(nome: str, conteudo: bytes) -> Documento:
         doc = _ler_html(conteudo)
     elif extensao == ".rtf":
         doc = _ler_rtf(conteudo)
+    elif extensao == ".eml":
+        doc = _ler_eml(conteudo)
     else:
         texto = _decodificar(conteudo)
         doc = Documento("", texto, [texto])
@@ -122,5 +142,11 @@ def parece_texto_corrido(conteudo: bytes) -> bool:
     for sep in (";", "\t", "|", ","):
         contagens = [l.count(sep) for l in linhas]
         if contagens[0] >= 1 and sum(c == contagens[0] for c in contagens) / len(contagens) > 0.8:
+            # Vírgula em frases ("Fulano: precisa melhorar, afastado...") não é tabela:
+            # tabela tem células curtas; prosa tem muitas palavras por "célula".
+            celulas = [c for l in linhas for c in l.split(sep)]
+            palavras = sum(len(c.split()) for c in celulas) / max(len(celulas), 1)
+            if palavras > 3 or any(":" in l.split(sep)[0] for l in linhas[:3]):
+                return True
             return False
     return True

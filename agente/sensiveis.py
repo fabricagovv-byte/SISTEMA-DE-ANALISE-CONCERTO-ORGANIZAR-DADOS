@@ -81,7 +81,7 @@ REGRAS: tuple[Regra, ...] = (
     Regra("Placa de veículo", "pessoal", re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b")),
     # Dados sensíveis (art. 5º, II) — indícios por termos.
     Regra("Saúde: CID", "sensivel", _f(r"\bCID(?:-?10)?\s*:?\s*[A-TV-Z]\d{2}(?:\.\d)?\b")),
-    Regra("Saúde", "sensivel", _f(r"\b(?:diagn[óo]stico|laudo m[ée]dico|atestado m[ée]dico|prontu[áa]rio|HIV|AIDS|soropositiv\w*|c[âa]ncer|neoplasia|transtorno mental|esquizofrenia|depress[ãa]o|dependente qu[íi]mico|gestante|gravidez|defici[êe]ncia (?:f[íi]sica|mental|visual|auditiva|intelectual)|PcD|autis\w+|TEA\b)")),
+    Regra("Saúde", "sensivel", _f(r"\b(?:diagn[óo]stico|laudo m[ée]dico|atestado m[ée]dico|prontu[áa]rio|HIV|AIDS|soropositiv\w*|c[âa]ncer|neoplasia|transtorno mental|esquizofrenia|depress[ãa]o|dependente qu[íi]mico|gestante|gravidez|gr[áa]vida|alergi\w*|afastad[oa] por|licen[çc]a m[ée]dica|defici[êe]ncia (?:f[íi]sica|mental|visual|auditiva|intelectual)|PcD|autis\w+|TEA\b)")),
     Regra("Origem racial ou étnica", "sensivel", _f(r"\b(?:ra[çc]a/cor|cor/ra[çc]a|ra[çc]a|etnia|ind[íi]gena|quilombola)\s*:?\s*(?:preta|parda|branca|amarela|ind[íi]gena|negra|\w+)?")),
     Regra("Convicção religiosa", "sensivel", _f(r"\b(?:religi[ãa]o|cren[çc]a religiosa|cat[óo]lic[oa]|evang[ée]lic[oa]|esp[íi]rita|umbanda|candombl[ée]|mu[çc]ulman[oa]|jud[ae]u|testemunha de jeov[áa])\b")),
     Regra("Opinião política / filiação partidária", "sensivel", _f(r"\b(?:filia[çc][ãa]o partid[áa]ria|filiad[oa] ao partido|militante)\b")),
@@ -99,9 +99,13 @@ REGRAS: tuple[Regra, ...] = (
     Regra("Usuário e senha (par)", "credencial", _f(
         r"(?m)^[ \t]*(?:admin|root|administrador|user|usu[áa]rio|login|sa)[ \t]*/[ \t]*(\S+)[ \t]*$"), None, 1),
     Regra("String de conexão com senha", "credencial", _f(r"\b[a-z][a-z0-9+.-]*://[^:\s/]+:([^@\s]+)@"), None, 1),
+    Regra("CVV de cartão", "financeiro", _f(r"\b(?:cvv|cvc|c[óo]d(?:igo)?\.? de seguran[çc]a)\s*:?\s*(\d{3,4})\b"), None, 1),
+    Regra("Usuário e senha (par)", "credencial", _f(r"\b(?:admin|root|administrador)\s*/\s*([^\s.,;]+)"), None, 1),
     Regra("Usuário de sistema", "credencial", _f(r"\b(?:user|usu[áa]rio|login|username)\s*[:=]\s*([^\s,;]+)"), None, 1),
     Regra("IP interno de servidor", "infraestrutura", re.compile(
         r"\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b")),
+    Regra("Endereço IP", "pessoal", re.compile(
+        r"\b(?!(?:10|127)\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")),
     Regra("Cartão de crédito", "financeiro", re.compile(r"(?<![\d.\-/])((?:\d[ \-]?){12,18}\d)(?![\d.\-/])"), _cartao_valido, 1),
     Regra("Criança/adolescente", "crianca", _f(r"\b(?:menor de idade|crian[çc]a|adolescente|rec[ée]m-nascid[oa]|ECA\b|tutelad[oa]|guarda (?:provis[óo]ria|definitiva))")),
 )
@@ -230,10 +234,14 @@ COLUNAS_CARTAO = {"cartao", "card", "numero_cartao", "cartao_credito", "cc", "nu
 
 def _classificar_coluna(coluna: str, tipo: str) -> tuple[str, str] | None:
     base = re.sub(r"_\d+$", "", coluna)
-    if base in COLUNAS_CREDENCIAIS:
-        return "Senha em texto puro", "credencial"
-    if base in COLUNAS_CARTAO:
+    if base in COLUNAS_CREDENCIAIS or base.startswith(("senha", "password", "passwd")) or base.endswith(("_senha", "_password")):
+        return ("Senha (hash) exposta" if re.search(r"md5|sha|hash", base) else "Senha em texto puro"), "credencial"
+    if base in COLUNAS_CARTAO or base.startswith(("cartao_", "card_number")) or base in {"card_number", "numero_do_cartao"}:
         return "Cartão de crédito", "financeiro"
+    if re.search(r"salari|remunera|vencimento_bruto|proventos|comiss", base):
+        return "Salário/remuneração", "pessoal"
+    if re.search(r"dependente|filh[oa]s?\b|menor", base):
+        return "Dependentes menores (criança/adolescente)", "crianca"
     if tipo == "cpf":
         return "CPF", "pessoal"
     if tipo == "cpf_cnpj":
@@ -260,33 +268,35 @@ def _classificar_coluna(coluna: str, tipo: str) -> tuple[str, str] | None:
 def encontrar_em_tabela(nome_tabela: str, df: pd.DataFrame, tipos: dict[str, str]) -> list[dict]:
     achados = []
     for coluna in df.columns:
+        classes = []
         classe = _classificar_coluna(coluna, tipos.get(coluna, "texto"))
-        if classe is None and tipos.get(coluna) == "texto":
-            # Conteúdo: e-mails/telefones/CPFs soltos em colunas de texto livre.
-            amostra = df[coluna].dropna().astype(str).head(200)
+        if classe:
+            classes.append(classe)
+        elif tipos.get(coluna) == "texto":
+            # Conteúdo de colunas de texto livre (observações, chave/valor de configuração...).
+            amostra = df[coluna].dropna().astype(str).head(500)
             for regra in REGRAS:
-                if regra.categoria not in {"pessoal", "financeiro", "credencial"} or regra.tipo in {"Nome de pessoa", "Endereço"}:
+                if regra.tipo in {"Nome de pessoa", "Endereço", "Placa de veículo"} or not len(amostra):
                     continue
-                hits = amostra.map(lambda x: any(
+                hits = amostra.map(lambda x, regra=regra: any(
                     (not regra.validar or regra.validar(m.group(regra.grupo))) for m in regra.padrao.finditer(x)
                 ))
-                if len(amostra) and hits.mean() > 0.3:
-                    classe = (regra.tipo, regra.categoria)
-                    break
-        if classe is None:
-            continue
-        tipo, categoria = classe
-        preenchidos = int(df[coluna].notna().sum())
-        exemplo = next((str(x) for x in df[coluna].dropna().head(1)), "")
-        achados.append({
-            "origem": nome_tabela,
-            "pagina_ou_coluna": coluna,
-            "tipo": tipo,
-            "categoria": categoria,
-            "valor_mascarado": mascarar(tipo, exemplo) if exemplo else "",
-            "contexto": f"{preenchidos} registro(s) preenchido(s) nesta coluna",
-            "_valor": "",
-        })
+                # Credencial, cartão, saúde, criança: basta UMA ocorrência. Pessoal comum: precisa ser frequente.
+                limite = 0.3 if regra.categoria in {"pessoal", "empresa"} else 0
+                if hits.mean() > limite and regra.categoria != "empresa" and (regra.tipo, regra.categoria) not in classes:
+                    classes.append((regra.tipo, regra.categoria))
+        for tipo, categoria in classes:
+            preenchidos = int(df[coluna].notna().sum())
+            exemplo = next((str(x) for x in df[coluna].dropna().head(1)), "")
+            achados.append({
+                "origem": nome_tabela,
+                "pagina_ou_coluna": coluna,
+                "tipo": tipo,
+                "categoria": categoria,
+                "valor_mascarado": mascarar(tipo, exemplo) if exemplo and categoria in {"pessoal", "financeiro"} else "[oculto]",
+                "contexto": f"{preenchidos} registro(s) preenchido(s) nesta coluna",
+                "_valor": "",
+            })
     return achados
 
 
@@ -297,7 +307,7 @@ def anonimizar_tabela(df: pd.DataFrame, achados_tabela: list[dict]) -> pd.DataFr
         coluna = achado["pagina_ou_coluna"]
         if coluna not in saida.columns:
             continue
-        if achado["categoria"] in {"sensivel", "credencial"}:
+        if achado["categoria"] in {"sensivel", "credencial", "crianca", "infraestrutura"}:
             saida = saida.drop(columns=[coluna])
         elif achado["tipo"] == "nome":
             saida[coluna] = saida[coluna].map(

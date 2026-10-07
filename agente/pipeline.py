@@ -11,6 +11,7 @@ from typing import Callable
 import pandas as pd
 
 from . import agente_ia
+from . import dominios as dom
 from . import entidades as ent
 from . import inventario as inv
 from . import sensiveis as sens
@@ -45,6 +46,8 @@ class ResultadoAgente:
     documentos_anonimizados: dict[str, str] = field(default_factory=dict)
     tabelas_anonimizadas: dict[str, pd.DataFrame] = field(default_factory=dict)
     inventario: pd.DataFrame = field(default_factory=pd.DataFrame)
+    fontes_lidas: list[str] = field(default_factory=list)
+    dominios: dict = field(default_factory=dict)
     entidades: ent.ResultadoEntidades | None = None
     inconsistencias_docs_base: pd.DataFrame = field(default_factory=pd.DataFrame)
 
@@ -85,6 +88,7 @@ def executar(
     # 1. Leitura: planilhas viram tabelas; PDF/Word/HTML/TXT corrido viram documentos.
     brutas: dict[str, pd.DataFrame] = {}
     caminhos: dict[str, str] = {}
+    fontes_lidas: list[str] = []
     documentos: dict[str, Documento] = {}
     segredos: dict[str, Documento] = {}
     for item in itens:
@@ -104,6 +108,7 @@ def executar(
                     continue
                 doc.nome = _nome_unico(doc.nome, documentos)
                 documentos[doc.nome] = doc
+                fontes_lidas.append(item.caminho)
                 registrar(f"📄 {doc.nome}: documento com {len(doc.paginas)} página(s), {len(doc.texto)} caracteres")
                 for aviso in doc.avisos:
                     registrar(f"⚠️ {doc.nome}: {aviso}")
@@ -118,7 +123,10 @@ def executar(
                     chave = _nome_unico(tabela, brutas)
                     brutas[chave] = df
                     caminhos[chave] = item.caminho
+                    if "linhas" not in df.attrs.get("leitura", {}):
+                        df.attrs.setdefault("leitura", {})["linhas"] = len(df)
                     item.observacoes += _descrever_leitura(df.attrs.get("leitura", {}))
+                    fontes_lidas.append(item.caminho)
                     registrar(f"📥 {chave}: {len(df)} linhas × {len(df.columns)} colunas")
         except Exception as erro:  # arquivo corrompido não deve derrubar os demais
             registrar(f"⚠️ Não foi possível ler '{nome}': {erro}")
@@ -205,7 +213,15 @@ def executar(
 
     # 6. Base única de pessoas + transações ligadas ao ID (quando há cadastros);
     #    senão, cruzamento genérico das tabelas por chave comum.
-    entidades = ent.consolidar(brutas, caminhos) if brutas else None
+    textos = [(d.nome, d.texto) for d in documentos.values()]
+    entidades = ent.consolidar(brutas, caminhos, textos) if brutas else None
+    dominios, resumo_dominios = dom.construir(brutas, caminhos, entidades) if brutas else ({}, {})
+    if entidades is not None and len(resumo_dominios.get("vendas", {}).get("fontes", [])) >= 2:
+        # As fontes de venda já viram uma base única de vendas: não repetir tabela por tabela.
+        for nome_t, df_t in list(entidades.transacoes.items()):
+            if any(f in resumo_dominios["vendas"]["fontes"] for f in df_t.attrs.get("fontes", [])):
+                entidades.transacoes.pop(nome_t)
+    _registrar_dominios(registrar, resumo_dominios)
     if entidades is not None:
         r = entidades.resumo
         registrar(
@@ -244,6 +260,7 @@ def executar(
     inventario_df = inv.tabela(itens)
     resumo = montar_resumo(tabelas, sinc, problemas, descricoes, fichas, dossies, lacunas, sensiveis, risco)
     resumo["inventario"] = _resumo_inventario(itens)
+    resumo["dominios"] = resumo_dominios
     if entidades is not None:
         resumo["base_unica"] = entidades.resumo
         resumo["suposicoes"] = _suposicoes(entidades.correcoes)
@@ -270,6 +287,8 @@ def executar(
         documentos_anonimizados=documentos_anonimizados,
         tabelas_anonimizadas=tabelas_anonimizadas,
         inventario=inventario_df,
+        dominios=dominios,
+        fontes_lidas=sorted(set(fontes_lidas)),
         entidades=entidades,
         inconsistencias_docs_base=inconsistencias,
     )
@@ -315,7 +334,7 @@ def _inconsistencias_docs_base(documentos: dict, entidades) -> pd.DataFrame:
     linhas_saida = []
     for doc in documentos.values():
         for numero, linha in enumerate(doc.texto.splitlines(), start=1):
-            chave_linha = f" {v.chave_nome(linha)} "
+            chave_linha = f" {ent._chave_texto(linha)} "
             citadas = [r for k, r in por_nome.items() if f" {k} " in chave_linha]
             cpfs = [v.somente_digitos(c) for c in cpf_re.findall(linha)]
             telefones = [t for t in tel_re.findall(linha) if v.somente_digitos(t) not in cpfs]
@@ -350,11 +369,35 @@ def _inconsistencias_docs_base(documentos: dict, entidades) -> pd.DataFrame:
     return pd.DataFrame(linhas_saida).drop_duplicates() if linhas_saida else pd.DataFrame()
 
 
+def _registrar_dominios(registrar, r: dict):
+    if f := r.get("fornecedores"):
+        registrar(f"🏭 Fornecedores: {f['total']} únicos; duplicados: {f['duplicados']}; CNPJ inválido: {', '.join(f['cnpj_invalido']) or 'nenhum'}.")
+    if p := r.get("produtos"):
+        registrar(f"📦 Produtos: {p['total']} no catálogo; saldo negativo: {len(p['saldo_negativo'])}.")
+    if vd := r.get("vendas"):
+        registrar(f"🧾 Vendas: {vd['linhas_lidas']} linhas em {len(vd['fontes'])} fonte(s) → {vd['vendas_validas']} vendas únicas, "
+                  f"R$ {vd['receita_bruta_brl']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    if c := r.get("conciliacao"):
+        registrar(f"💳 Conciliação: {c['pagamentos']} pagamentos; {len(c['divergentes'])} com valor divergente.")
+
+
 def _descrever_leitura(info: dict) -> list[str]:
     obs = []
-    if info.get("formato") in {"CSV", "JSON"}:
+    if info.get("formato") in {"CSV", "JSON", "JSONL", "XML", "dump SQL"}:
         obs.append(f"{info['formato']} em {info.get('codificacao')}" + (f", separador '{info['separador']}'" if info.get("separador") else "")
                    + " → saída em UTF-8")
+    if info.get("formato") == "CSV em base64 dentro do JSON":
+        obs.append(f"CSV escondido em base64 no campo '{info.get('campo')}' extraído ({info.get('linhas', '?')} linhas)")
+    if info.get("formato") in {"SQLite", "dump SQL"} and info.get("tabela"):
+        obs.append(f"tabela '{info['tabela']}' lida")
+    if info.get("aba_oculta"):
+        obs.append(f"⚠️ aba OCULTA '{info.get('aba')}' encontrada e lida")
+    if info.get("linhas_json_quebradas"):
+        obs.append(f"linha(s) com JSON quebrado/inválido ignorada(s): {info['linhas_json_quebradas']}")
+    if info.get("formulas_calculadas"):
+        obs.append(f"{info['formulas_calculadas']} fórmula(s) sem resultado salvo recalculada(s)")
+    if info.get("linhas_soma_removidas"):
+        obs.append(f"linha(s) de SOMA no meio dos dados removida(s): {info['linhas_soma_removidas']}")
     if info.get("cabecalho_na_linha"):
         obs.append(f"cabeçalho na linha {info['cabecalho_na_linha']} (título ignorado: '{info.get('titulo_ignorado', '')}')")
     if info.get("cabecalhos_corrigidos"):
@@ -496,6 +539,7 @@ def montar_resumo(
 def parecer_automatico(resumo: dict) -> str:
     linhas = ["# Parecer do processamento", ""]
     linhas += _parecer_inventario_e_base(resumo)
+    linhas += _parecer_dominios(resumo.get("dominios") or {})
     if resumo["documentos"]:
         linhas += ["## Documentos recebidos", ""]
         for d in resumo["documentos"]:
@@ -610,11 +654,65 @@ def _parecer_inventario_e_base(resumo: dict) -> list[str]:
     return linhas
 
 
+def _brl(x: float) -> str:
+    return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _parecer_dominios(r: dict) -> list[str]:
+    linhas = []
+    if vd := r.get("vendas"):
+        linhas += ["## Vendas (todas as fontes, sem duplicidade)", ""]
+        linhas.append(f"- {vd['linhas_lidas']} linhas lidas em {len(vd['fontes'])} fonte(s): {', '.join(vd['fontes'])}.")
+        linhas.append(f"- **{vd['vendas_validas']} vendas únicas — receita bruta {_brl(vd['receita_bruta_brl'])}** (antes de estornos).")
+        for ano, x in sorted(vd["por_ano"].items()):
+            linhas.append(f"  - {ano}: {x['vendas']} vendas, {_brl(x['receita'])}")
+        if vd["ja_lancadas_em_outra_fonte"]:
+            linhas.append(f"- {vd['ja_lancadas_em_outra_fonte']} linha(s) já lançadas em outra fonte (ex.: caixa manual × e-commerce) — não somadas de novo.")
+        if vd["duplicatas_outro_codigo"]:
+            linhas.append(f"- {vd['duplicatas_outro_codigo']} pedido(s) duplicado(s) com outro código (mesmo número, cliente e valor).")
+        if vd["centavos_convertidos"]:
+            linhas.append(f"- {vd['centavos_convertidos']} valor(es) vinham em CENTAVOS (confirmado contra o preço do catálogo) — convertidos para reais.")
+        if vd["utc_convertidos"]:
+            linhas.append(f"- {vd['utc_convertidos']} horário(s) em UTC convertidos para horário de Brasília (−3h).")
+        if vd["ambiguas"]:
+            linhas.append(f"- ⚠️ {len(vd['ambiguas'])} venda(s) com cliente AMBÍGUO (homônimos) — NÃO atribuídas: {', '.join(vd['ambiguas'])}.")
+        if vd["orfas_invalidas"]:
+            linhas.append("- ❌ Vendas separadas (fora da receita):")
+            linhas += [f"  - {o['pedido']}: {o['motivo']}" for o in vd["orfas_invalidas"]]
+        linhas.append("")
+    if c := r.get("conciliacao"):
+        linhas += ["## Conciliação pagamentos × vendas", ""]
+        linhas.append(f"- {c['pagamentos']} pagamento(s) analisado(s).")
+        linhas.append(f"- **{len(c['divergentes'])} com valor diferente da venda:** {', '.join(c['divergentes']) or 'nenhum'}.")
+        if c["sem_venda"]:
+            linhas.append(f"- Pagamentos sem venda correspondente: {', '.join(c['sem_venda'])}.")
+        linhas.append(f"- Estornos: {c['qtd_estornos']} ({_brl(c['estornos_brl'])}); chargebacks: {c['qtd_chargebacks']} ({_brl(c['chargebacks_brl'])}).")
+        linhas.append("")
+    if p := r.get("produtos"):
+        linhas += ["## Produtos e estoque", ""]
+        linhas.append(f"- {p['total']} produtos no catálogo (preços em R$, pesos em kg).")
+        linhas += [f"- Ignorado: {e}" for e in p["excluidos"]]
+        if p["saldo_negativo"]:
+            linhas.append(f"- ⚠️ **{len(p['saldo_negativo'])} SKU(s) com saldo NEGATIVO** (saiu mais do que entrou): {', '.join(p['saldo_negativo'])}.")
+        if e := r.get("estoque"):
+            linhas.append(f"- Tipos de movimento encontrados: {', '.join(e['tipos_encontrados'])} → padronizados em entrada/saída.")
+            linhas += [f"- Movimento ignorado: {m}" for m in e["movimentos_ignorados"]]
+        linhas.append("")
+    if f := r.get("fornecedores"):
+        linhas += ["## Fornecedores", ""]
+        linhas.append(f"- {f['total']} fornecedores únicos; {f['duplicados']} estava(m) duplicado(s) na origem.")
+        if f["cnpj_invalido"]:
+            linhas.append(f"- ❌ CNPJ inválido: {', '.join(f['cnpj_invalido'])}.")
+        linhas.append("")
+    return linhas
+
+
 def _sem_segredos(df: pd.DataFrame, origem: str, sensiveis: pd.DataFrame) -> pd.DataFrame:
     """Remove colunas com senha/cartão antes de qualquer exportação."""
     if not len(sensiveis):
         return df
-    ruins = sensiveis[(sensiveis["origem"] == origem) & sensiveis["categoria"].isin(["credencial", "financeiro"])]
+    ruins = sensiveis[(sensiveis["origem"] == origem)
+                      & sensiveis["categoria"].isin(["credencial", "financeiro", "sensivel", "crianca", "infraestrutura"])]
     return df.drop(columns=[c for c in ruins["pagina_ou_coluna"] if c in df.columns])
 
 
@@ -654,6 +752,11 @@ def gerar_excel(resultado: ResultadoAgente) -> bytes:
             abas += [("Conflitos_entre_fontes", e.conflitos), ("Correcoes_aplicadas", e.correcoes),
                      ("Nao_vinculados", e.nao_vinculados), ("Fontes_avaliadas", e.fontes),
                      ("Docs_x_Base_inconsistencias", resultado.inconsistencias_docs_base)]
+        nomes_dom = {"vendas": "Vendas_base_unica", "vendas_excluidas": "Vendas_separadas", "conciliacao": "Conciliacao_pagamentos",
+                     "produtos": "Produtos_estoque", "movimentos_estoque": "Movimentos_estoque", "fornecedores": "Fornecedores"}
+        abas += [(nomes_dom.get(k, k), df) for k, df in resultado.dominios.items()]
+        if e is not None:
+            abas += [(f"Cadastro_{n}", df) for n, df in e.outros_cadastros.items()]
         abas += [
             ("Risco_LGPD", resultado.risco),
             ("Dados_sensiveis_LGPD", resultado.sensiveis),
@@ -712,6 +815,12 @@ def gerar_pacote_zip(resultado: ResultadoAgente) -> bytes:
                              ("nao_vinculados", e.nao_vinculados), ("fontes_avaliadas", e.fontes)):
                 if len(df):
                     z.writestr(f"relatorios/{nome}.csv", csv(df))
+        for nome, df in resultado.dominios.items():
+            pasta = "relatorios" if nome in {"vendas_excluidas", "conciliacao", "movimentos_estoque"} else "dados"
+            z.writestr(f"{pasta}/{nome}.csv", csv(df))
+        if e is not None:
+            for nome, df in e.outros_cadastros.items():
+                z.writestr(f"dados/outros_cadastros/{nome}.csv", csv(df))
         if len(resultado.sensiveis):
             z.writestr("relatorios/dados_sensiveis.csv", csv(resultado.sensiveis))
             z.writestr("relatorios/risco_lgpd.csv", csv(resultado.risco))

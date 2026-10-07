@@ -10,6 +10,14 @@ Você sobe **documentos públicos** (PDF, Word, HTML, TXT, RTF) e **bases de dad
 - **Transações ligadas ao ID** (vendas, pedidos...): o cliente pode vir por ID, nome completo, só primeiro nome, e-mail ou objeto aninhado com CPF.
 - **Segredos**: senhas em texto puro, chaves de API, `.env`, strings de conexão, IP interno, **números de cartão (validados por Luhn)** — risco CRÍTICO, removidos de todas as saídas.
 
+### 🏪 Vendas, estoque, fornecedores e pagamentos
+- **Formatos**: CSV (UTF-8, Latin-1, **UTF-16 com TAB**), Excel (fórmulas sem resultado salvo, linha de SOMA no meio, **abas ocultas**), **XML**, **SQLite (.db)**, **dump SQL**, **JSONL** (com linha quebrada), JSON com **CSV em base64** escondido, **e-mail .eml**, **log**, YAML, ZIP dentro de ZIP.
+- **Vendas de várias fontes numa base única**, sem contar duas vezes: o mesmo pedido no caixa manual e no e-commerce, pedidos repetidos com outro código (`WEB-00052` = `PV00052`), valores em **centavos** (confirmado contra o preço do catálogo), horário **UTC → Brasília**, datas em serial do Excel/epoch/sem ano, cliente por ID, nome, CPF ou e-mail antigo/novo. Vendas órfãs, inválidas ou de cliente **homônimo (ambíguo)** ficam listadas à parte.
+- **Estoque**: catálogo com preço em `R$`, decimal ou centavos e peso em g/kg; registros deletados ignorados; saldo por SKU com **negativos sinalizados**; movimentos de SKU inexistente ou com data futura separados.
+- **Fornecedores**: duplicados unificados, CNPJ validado.
+- **Conciliação**: pagamentos × vendas, valores divergentes, estornos e chargebacks.
+- **Cadastros separados**: leads (com consentimento LGPD) e colaboradores não se misturam com clientes; homônimos com IDs/CPFs diferentes nunca são unidos.
+
 ### 📄 Documentos públicos
 1. **Lê** PDF (texto e tabelas), DOCX (parágrafos e tabelas), HTML, TXT, MD e RTF. Tabelas encontradas dentro dos documentos entram no cruzamento de dados.
 2. **Organiza**: identifica o tipo (edital, contrato, termo aditivo, nota de empenho, ordem bancária, ata, portaria, decreto, ofício, parecer, relatório...), o órgão, número, data, objeto, valores, CNPJs, processos (SEI), contratos, licitações e empenhos citados.
@@ -70,6 +78,7 @@ Sem a chave, tudo funciona com as regras automáticas. Modelo padrão: `claude-o
 agente/
   inventario.py     pasta/ZIP: lixo, duplicatas, nomes ruins, quarentena de segredos
   entidades.py      base única de pessoas, conflitos e transações ligadas ao ID
+  dominios.py       vendas unificadas, produtos/estoque, fornecedores e conciliação de pagamentos
   leitor.py         leitura de CSV/Excel/JSON (cabeçalho deslocado, TOTAL, rascunho, encoding)
   documentos.py     leitura de PDF/DOCX/HTML/TXT/RTF (texto + tabelas)
   organizador_docs.py  classificação, metadados, dossiês, continuação e lacunas
@@ -81,7 +90,7 @@ agente/
   pipeline.py       orquestração e geração do Excel
 app.py              interface web (Streamlit)
 exemplos/           bases e documentos fictícios (edital, contrato, aditivo, empenho, ofício, relatório em partes)
-tests/              testes automáticos (python -m pytest), incl. teste de aceitação com banco_desorganizado.zip
+tests/              testes automáticos (python -m pytest), incl. testes de aceitação com banco_desorganizado.zip e empresa_dados_caos.zip
 ```
 
 ## Regras do cruzamento

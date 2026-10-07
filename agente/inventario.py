@@ -44,8 +44,15 @@ RUIDO_NOME = re.compile(
     r"sem t[ií]tulo|untitled|old|antig\w*|backup|bkp|ultim[oa]|revisad\w*",
     re.IGNORECASE,
 )
-EXT_DADOS = {".csv", ".xlsx", ".xlsm", ".xls", ".json", ".tsv"}
-EXT_DOCUMENTO = {".pdf", ".docx", ".html", ".htm", ".md", ".rtf", ".txt"}
+EXT_DADOS = {".csv", ".xlsx", ".xlsm", ".xls", ".json", ".tsv", ".jsonl", ".ndjson", ".xml", ".db", ".sqlite",
+             ".sqlite3", ".sql"}
+EXT_DOCUMENTO = {".pdf", ".docx", ".html", ".htm", ".md", ".rtf", ".txt", ".log", ".eml"}
+EXT_CONFIG = {".yaml", ".yml", ".ini", ".conf", ".cfg", ".toml", ".properties", ".env", ".bak", ".config"}
+SEGREDO_CONTEUDO = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:password|passwd|senha|secret(?:_key)?|api[_-]?key|token|aws_secret)\b\s*[:=]\s*\S+"
+    r"|\b[a-z][a-z0-9+.-]*://[^:\s/]+:[^@\s]+@|\bAKIA[0-9A-Z]{16}\b",
+    re.IGNORECASE,
+)
 LIMITE_DESCOMPACTADO = 500 * 1024 * 1024
 LIMITE_ARQUIVOS = 5000
 
@@ -79,7 +86,12 @@ def expandir(arquivos: list[tuple[str, bytes]]) -> list[Item]:
         nonlocal total
         if caminho.lower().endswith(".zip") and profundidade < 3:
             with zipfile.ZipFile(io.BytesIO(conteudo)) as z:
-                raiz = PurePosixPath(caminho).stem if profundidade else ""
+                # ZIP dentro do ZIP: os arquivos internos ficam em "<caminho do zip>/<nome>".
+                raiz = caminho if profundidade else ""
+                if profundidade:
+                    conteiner = Item(caminho, conteudo, categoria="conteiner")
+                    conteiner.situacao = f"ZIP aninhado aberto ({sum(not i.is_dir() for i in z.infolist())} arquivo(s) dentro)"
+                    itens.append(conteiner)
                 for info in z.infolist():
                     if info.is_dir():
                         continue
@@ -94,7 +106,7 @@ def expandir(arquivos: list[tuple[str, bytes]]) -> list[Item]:
     for nome, conteudo in arquivos:
         adicionar(nome, conteudo)
     # Se tudo está dentro de uma única pasta raiz (ZIP de uma pasta), tira esse prefixo.
-    raizes = {i.caminho.split("/", 1)[0] for i in itens if "/" in i.caminho}
+    raizes = {i.caminho.split("/", 1)[0] for i in itens}
     if len(raizes) == 1 and all("/" in i.caminho for i in itens):
         prefixo = raizes.pop() + "/"
         for i in itens:
@@ -132,7 +144,8 @@ def _limpar_nome(caminho: str) -> str:
 def analisar(itens: list[Item]) -> list[Item]:
     vistos: dict[str, Item] = {}
     # Fica com a versão "melhor" de cada conteúdo: fora de backup e mais perto da raiz.
-    ordem = sorted(itens, key=lambda i: (bool(re.search(r"backup|old|antig|c[óo]pia|copy", i.caminho, re.I)),
+    ordem = sorted(itens, key=lambda i: (bool(re.search(r"backup|old|antig|c[óo]pia|copy|lixeira|trash|\.bak$|nao usar|não usar",
+                                                         i.caminho, re.I)),
                                          i.caminho.count("/"), i.caminho))
     for item in ordem:
         item.sha256 = hashlib.sha256(item.conteudo).hexdigest()
@@ -160,10 +173,14 @@ def analisar(itens: list[Item]) -> list[Item]:
             item.situacao = f"REMOVER — cópia idêntica de '{original.caminho}'"
             continue
         vistos[item.sha256] = item
-        if SEGREDO_NOMES.search(nome):
+        if item.categoria == "conteiner":
+            continue
+        texto_inicio = item.conteudo[:200_000].decode("utf-8", "ignore")
+        eh_config = item.extensao in EXT_CONFIG or (not item.extensao and item.conteudo[:16] != b"SQLite format 3\x00")
+        if SEGREDO_NOMES.search(nome) or (eh_config and SEGREDO_CONTEUDO.search(texto_inicio)):
             item.categoria = "segredo"
             item.situacao = "QUARENTENA — credenciais/segredos: analisado, NÃO copiado para a saída"
-        elif item.extensao in EXT_DADOS:
+        elif item.extensao in EXT_DADOS or item.conteudo[:16] == b"SQLite format 3\x00":
             item.categoria, item.situacao = "dados", "processado"
         elif item.extensao in EXT_DOCUMENTO:
             item.categoria, item.situacao = "documento", "processado"

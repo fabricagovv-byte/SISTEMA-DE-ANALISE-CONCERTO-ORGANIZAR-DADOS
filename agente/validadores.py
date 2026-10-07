@@ -88,6 +88,10 @@ def converter_valor_monetario(valor: str) -> float | None:
     texto = str(valor or "").strip()
     if not texto:
         return None
+    # Texto com palavras (URL, senha, código) não é número — só símbolos de moeda são aceitos.
+    sem_moeda = re.sub(r"R\$|US\$|USD|BRL|EUR|reais|real|centavos?|€|\$", "", texto, flags=re.I)
+    if re.search(r"[A-Za-zÀ-ú]{2,}|[@/:#]", sem_moeda):
+        return None
     negativo = texto.startswith("(") and texto.endswith(")") or texto.startswith("-")
     texto = re.sub(r"[^\d,.]", "", texto)
     if not texto:
@@ -138,7 +142,8 @@ MESES_ABREV = {
     "set": 9, "out": 10, "nov": 11, "dez": 12,
     "feb": 2, "apr": 4, "may": 5, "aug": 8, "sep": 9, "oct": 10, "dec": 12,
 }
-VAZIOS = {"", "nan", "none", "null", "n/a", "na", "nd", "-", "--", "s/n", "sem", "nat"}
+VAZIOS = {"", "nan", "none", "null", "n/a", "na", "nd", "-", "--", "s/n", "sem", "nat", "sem telefone", "sem email",
+          "sem e-mail", "nao informado", "não informado", "nao tem", "não tem", "?"}
 
 
 def vazio(valor) -> bool:
@@ -287,18 +292,33 @@ CIDADES = {
 }
 
 
+CIDADES_ABREV = {
+    "bhorizonte": "Belo Horizonte", "bhte": "Belo Horizonte", "spaulo": "São Paulo", "sampa": "São Paulo",
+    "rjaneiro": "Rio de Janeiro", "palegre": "Porto Alegre", "ptoalegre": "Porto Alegre", "fpolis": "Florianópolis",
+    "cwb": "Curitiba", "rec": "Recife", "ssa": "Salvador", "poa": "Porto Alegre", "bsb": "Brasília",
+    "for": "Fortaleza", "bel": "Belém", "mao": "Manaus", "gyn": "Goiânia", "nat": "Natal",
+}
+
+
 def normalizar_cidade(valor) -> tuple[str | None, str]:
     if vazio(valor):
         return None, ""
     texto = re.sub(r"\s+", " ", corrigir_mojibake(str(valor))).strip()
+    # "recife-PE", "salvador/BA", "Curitiba - PR": tira a UF do fim.
+    sem_uf = re.sub(r"\s*[-/,]\s*([A-Za-z]{2})$", lambda m: "" if m.group(1).upper() in UFS else m.group(0), texto)
+    alerta_uf = "UF removida do nome da cidade" if sem_uf != texto else ""
+    texto = sem_uf
     chave = remover_acentos(texto).lower()
+    compacta = re.sub(r"[^a-z]", "", chave)
+    if compacta in CIDADES_ABREV:
+        return CIDADES_ABREV[compacta], "abreviação expandida"
     if chave in CIDADES:
         cidade = CIDADES[chave]
-        return cidade, ("abreviação expandida" if len(chave) <= 4 and chave != cidade.lower() else "")
-    return normalizar_nome(texto), ""
+        return cidade, ("abreviação expandida" if len(chave) <= 4 and chave != cidade.lower() else alerta_uf)
+    return normalizar_nome(texto), alerta_uf
 
 
-def normalizar_telefone(valor, ddd_padrao: str | None = None) -> tuple[str | None, str]:
+def normalizar_telefone(valor, ddd_padrao: str | None = None, aceitar_sem_ddd: bool = False) -> tuple[str | None, str]:
     """Formato único: +55 (DD) 9XXXX-XXXX. Sem DDD, usa `ddd_padrao` (e avisa)."""
     if vazio(valor):
         return None, "telefone vazio"
@@ -310,6 +330,9 @@ def normalizar_telefone(valor, ddd_padrao: str | None = None) -> tuple[str | Non
     alerta = ""
     if len(d) in (8, 9):
         if not ddd_padrao:
+            if aceitar_sem_ddd:
+                d = d if len(d) == 9 else d
+                return (f"{d[:5]}-{d[5:]}" if len(d) == 9 else f"{d[:4]}-{d[4:]}"), "telefone SEM DDD na origem — completar"
             return None, f"telefone sem DDD ({valor})"
         d, alerta = ddd_padrao + d, f"DDD {ddd_padrao} inferido"
     if len(d) == 11 and d[2] == "9":
@@ -423,3 +446,98 @@ def formato_de(campo: str, valor) -> str:
             return "minúsculas"
         return "Normal"
     return "—"
+
+
+# ---------- Data e hora com fuso; preços ----------
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+FUSO_BRASILIA = timezone(timedelta(hours=-3))  # sem horário de verão desde 2019
+
+
+def interpretar_data_hora(valor, preferencia: str | dict = "DM", utc: bool = False,
+                          ano_padrao: int | None = None) -> tuple[datetime | None, bool, str]:
+    """Data/hora em horário de Brasília. Retorna (datetime sem fuso, tem_hora, alerta).
+
+    Entende: ISO com 'Z'/offset (converte para Brasília), coluna marcada como UTC, epoch em
+    segundos/milissegundos (UTC), número serial do Excel, 'dd/mm' sem ano (usa `ano_padrao`)
+    e todos os formatos de `interpretar_data`.
+    """
+    if vazio(valor):
+        return None, False, ""
+    texto = str(valor).strip()
+    if re.fullmatch(r"\d+(\.\d+)?", texto):
+        n = float(texto)
+        if 20000 <= n <= 80000:
+            data = datetime(1899, 12, 30) + timedelta(days=n)
+            return data, n % 1 != 0, "data em número serial do Excel convertida"
+        if 9e8 <= n <= 4.2e9 or 9e11 <= n <= 4.2e12:
+            segundos = n / 1000 if n > 1e11 else n
+            em_utc = datetime.fromtimestamp(segundos, timezone.utc)
+            data = em_utc.astimezone(FUSO_BRASILIA).replace(tzinfo=None)
+            alerta = "data em epoch (segundos desde 1970, UTC) convertida para horário de Brasília"
+            if data.date() != em_utc.date():
+                alerta += (f" — ATENÇÃO: o dia muda com o fuso (em UTC seria {em_utc:%d/%m/%Y %H:%M}); "
+                           "se o sistema de origem gravou horário local, a data correta é a de UTC")
+            return data, True, alerta
+    m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})[T ](\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s*(Z|[+-]\d{2}:?\d{2}|UTC)?", texto, re.I)
+    if m:
+        try:
+            data = datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}")
+        except ValueError:
+            return None, False, "data inexistente"
+        fuso = (m.group(3) or "").upper()
+        if fuso in {"Z", "UTC"} or (not fuso and utc):
+            data = data.replace(tzinfo=timezone.utc).astimezone(FUSO_BRASILIA).replace(tzinfo=None)
+            return data, True, "horário UTC convertido para Brasília (−3h)"
+        if fuso:
+            offset = fuso.replace(":", "")
+            tz = timezone(timedelta(hours=int(offset[:3]), minutes=int(offset[0] + offset[3:])))
+            data = data.replace(tzinfo=tz).astimezone(FUSO_BRASILIA).replace(tzinfo=None)
+        return data, True, ""
+    if (m := re.fullmatch(r"(\d{1,2})[/\-.](\d{1,2})", texto)) and ano_padrao:
+        a, b = int(m[1]), int(m[2])
+        dia, mes = (a, b) if (preferencia if isinstance(preferencia, str) else preferencia.get("/", "DM")) == "DM" or b > 12 else (b, a)
+        try:
+            return datetime(ano_padrao, mes, dia), False, f"data sem ano: assumido {ano_padrao} (ano do arquivo)"
+        except ValueError:
+            return None, False, "data inexistente"
+    if m := re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})\s+(\d{1,2}:\d{2})(?::\d{2})?(?:\s*\((BRT|UTC)\))?", texto, re.I):
+        data, alerta = interpretar_data(f"{m[1]}/{m[2]}/{m[3]}", preferencia)
+        if data is None:
+            return None, False, alerta or "data inválida"
+        h, mi = map(int, m[4].split(":"))
+        dt = datetime(data.year, data.month, data.day, h, mi)
+        if (m[5] or "").upper() == "UTC" or (not m[5] and utc):
+            dt = dt.replace(tzinfo=timezone.utc).astimezone(FUSO_BRASILIA).replace(tzinfo=None)
+            alerta = (alerta + "; " if alerta else "") + "horário UTC convertido para Brasília (−3h)"
+        return dt, True, alerta
+    data, alerta = interpretar_data(texto, preferencia)
+    if data is None:
+        return None, False, alerta or "data inválida"
+    return datetime(data.year, data.month, data.day), False, alerta
+
+
+def interpretar_preco(valor) -> tuple[float | None, str]:
+    """'R$ 12,34' | '12.34' | '1234 centavos' → 12.34."""
+    if vazio(valor):
+        return None, ""
+    texto = str(valor).strip().lower()
+    if re.search(r"centavos?|cents?\b", texto):
+        d = re.sub(r"[^\d]", "", texto)
+        return (int(d) / 100 if d else None), "preço em centavos convertido para reais"
+    numero = converter_valor_monetario(texto)
+    return numero, ("" if numero is not None else f"preço não reconhecido ({valor})")
+
+
+def converter_peso_kg(valor, unidade) -> tuple[float | None, str]:
+    numero = converter_valor_monetario(valor) if not isinstance(valor, (int, float)) else float(valor)
+    if numero is None:
+        return None, ""
+    u = remover_acentos(str(unidade or "kg")).strip().lower()
+    if u in {"g", "gr", "grama", "gramas"}:
+        return round(numero / 1000, 4), "peso em gramas convertido para kg"
+    if u in {"mg"}:
+        return round(numero / 1e6, 6), "peso em mg convertido para kg"
+    if u in {"t", "ton", "tonelada"}:
+        return round(numero * 1000, 3), "peso em toneladas convertido para kg"
+    return round(numero, 4), ""
