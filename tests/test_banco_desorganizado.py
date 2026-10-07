@@ -120,3 +120,32 @@ def test_nenhum_segredo_vaza_nas_saidas(saidas):
             assert segredo not in texto, segredo
     assert not any("senhas_sistema" in n or n.endswith(".env") for n in arquivos)
     assert "dados/clientes.csv" in arquivos and "dados/vendas_2024.csv" in arquivos and "dados/pedidos.csv" in arquivos
+
+
+def test_parecer_alerta_suposicoes(r):
+    suposicoes = {s["suposicao"]: s["quantidade"] for s in r.resumo["suposicoes"]}
+    assert suposicoes["valor sem moeda indicada: assumido R$ (BRL)"] == 12
+    assert any("moeda estrangeira" in s for s in suposicoes)
+    assert "Alertas e suposições" in r.parecer and "assumido R$ (BRL)" in r.parecer
+
+
+def test_emails_com_acento_sinalizados(r):
+    c = r.entidades.pessoas
+    com_acento = c[~c["email"].fillna("").map(str.isascii)]
+    assert set(com_acento["id_cliente"]) == {"10", "15"}  # João e Olívia
+    assert com_acento["observacoes"].str.contains("e-mail com acento").all()
+    assert "jo***@exemplo.com" in r.parecer
+
+
+def test_cpf_das_notas_diverge_do_cadastro_do_bruno(r):
+    inc = r.inconsistencias_docs_base
+    bruno = inc[(inc["documento"] == "notas") & (inc["id_cliente"].astype(str) == "2")]
+    situacoes = " | ".join(bruno["situacao"])
+    assert "diferente do CPF da pessoa na base" in situacoes
+    assert "teste/sequencial" in situacoes
+    assert "telefone" in set(bruno["campo"])
+    assert "123.456.789-09" not in r.parecer and "98765-4321" not in r.parecer
+
+
+def test_parecer_sem_dossies_triviais(r):
+    assert "Dossiês e continuação" not in r.parecer

@@ -46,6 +46,7 @@ class ResultadoAgente:
     tabelas_anonimizadas: dict[str, pd.DataFrame] = field(default_factory=dict)
     inventario: pd.DataFrame = field(default_factory=pd.DataFrame)
     entidades: ent.ResultadoEntidades | None = None
+    inconsistencias_docs_base: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def _nome_unico(nome: str, usados) -> str:
@@ -223,6 +224,9 @@ def executar(
         for obs in sinc.observacoes:
             registrar(f"🔗 {obs}")
     cruzamento = _cruzar_documentos_e_dados(sensiveis, fichas_obj, tabelas)
+    inconsistencias = _inconsistencias_docs_base(documentos, entidades)
+    if len(inconsistencias):
+        registrar(f"⚠️ {len(inconsistencias)} inconsistência(s) entre documentos/anotações e a base única.")
     if len(cruzamento):
         registrar(f"🔗 {len(cruzamento)} CPF/CNPJ citado(s) em documentos também aparece(m) nas tabelas.")
 
@@ -242,6 +246,8 @@ def executar(
     resumo["inventario"] = _resumo_inventario(itens)
     if entidades is not None:
         resumo["base_unica"] = entidades.resumo
+        resumo["suposicoes"] = _suposicoes(entidades.correcoes)
+    resumo["inconsistencias_docs_base"] = inconsistencias.to_dict("records")
     parecer = parecer_automatico(resumo)
     if ia:
         registrar("🤖 IA redigindo o parecer...")
@@ -265,7 +271,83 @@ def executar(
         tabelas_anonimizadas=tabelas_anonimizadas,
         inventario=inventario_df,
         entidades=entidades,
+        inconsistencias_docs_base=inconsistencias,
     )
+
+
+# Alertas que representam uma SUPOSIÇÃO do agente (não uma correção objetiva) — vão para o parecer.
+SUPOSICOES = (
+    ("moeda não informada", "valor sem moeda indicada: assumido R$ (BRL)"),
+    ("não convertido para BRL", "valor em moeda estrangeira mantido sem conversão (não há cotação nos arquivos)"),
+    ("data ambígua: assumido DD/MM", "data ambígua (ex.: 02/10): assumido DD/MM, padrão brasileiro"),
+    ("data ambígua: assumido MM/DD", "data ambígua (ex.: 07/04): assumido MM/DD, porque a maioria da coluna é americana"),
+    ("formato americano MM/DD", "data em formato americano (MM/DD) convertida"),
+    ("inferido", "telefone sem DDD: DDD inferido (o mais comum na base)"),
+    ("não-ASCII", "e-mail com acento aceito, mas pode ser rejeitado por outros sistemas"),
+)
+
+
+def _suposicoes(correcoes: pd.DataFrame) -> list[dict]:
+    if correcoes is None or correcoes.empty:
+        return []
+    saida = []
+    for trecho, descricao in SUPOSICOES:
+        casos = correcoes[correcoes["alerta"].astype(str).str.contains(trecho, regex=False)]
+        if len(casos):
+            por_tabela = casos.groupby("tabela").size().to_dict()
+            saida.append({"suposicao": descricao, "quantidade": len(casos),
+                          "onde": ", ".join(f"{t} ({n})" for t, n in por_tabela.items())})
+    return saida
+
+
+CPF_TESTE = {"12345678909", "01234567890", "98765432100"}
+
+
+def _inconsistencias_docs_base(documentos: dict, entidades) -> pd.DataFrame:
+    """Pessoa da base citada num documento/anotação com CPF ou telefone diferente do cadastro."""
+    if entidades is None or not documentos:
+        return pd.DataFrame()
+    pessoas = entidades.pessoas
+    por_nome = {v.chave_nome(n): r for n, r in zip(pessoas["nome"], pessoas.to_dict("records")) if n}
+    por_cpf = {v.somente_digitos(r["cpf"]): r for r in pessoas.to_dict("records") if r.get("cpf")}
+    cpf_re = re.compile(r"(?<![\d./-])\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?![\d./-])")
+    tel_re = re.compile(r"(?<!\d)(?:\+?55\s?)?\(?\d{2}\)?\s?9?\d{4}[-\s]?\d{4}(?!\d)")
+    linhas_saida = []
+    for doc in documentos.values():
+        for numero, linha in enumerate(doc.texto.splitlines(), start=1):
+            chave_linha = f" {v.chave_nome(linha)} "
+            citadas = [r for k, r in por_nome.items() if f" {k} " in chave_linha]
+            cpfs = [v.somente_digitos(c) for c in cpf_re.findall(linha)]
+            telefones = [t for t in tel_re.findall(linha) if v.somente_digitos(t) not in cpfs]
+            for cpf in cpfs:
+                if cpf in CPF_TESTE or len(set(cpf)) == 1:
+                    linhas_saida.append({"documento": doc.nome, "linha": numero, "pessoa": ", ".join(r["nome"] for r in citadas),
+                                         "id_cliente": ", ".join(str(r["id_cliente"]) for r in citadas), "campo": "cpf",
+                                         "valor_no_documento": sens.mascarar("CPF", cpf), "valor_na_base": "",
+                                         "situacao": "CPF de teste/sequencial (dígitos em sequência) — provavelmente fictício"})
+                dono = por_cpf.get(cpf)
+                if dono is not None and citadas and all(dono["id_cliente"] != r["id_cliente"] for r in citadas):
+                    linhas_saida.append({"documento": doc.nome, "linha": numero, "pessoa": ", ".join(r["nome"] for r in citadas),
+                                         "id_cliente": ", ".join(str(r["id_cliente"]) for r in citadas), "campo": "cpf",
+                                         "valor_no_documento": sens.mascarar("CPF", cpf), "valor_na_base": sens.mascarar("CPF", dono["cpf"]),
+                                         "situacao": f"CPF pertence a outra pessoa da base ({dono['nome']}, id {dono['id_cliente']})"})
+            for r in citadas:
+                cpf_base = v.somente_digitos(r.get("cpf") or "")
+                for cpf in cpfs:
+                    if cpf_base and cpf != cpf_base and por_cpf.get(cpf) is None:
+                        linhas_saida.append({"documento": doc.nome, "linha": numero, "pessoa": r["nome"], "id_cliente": r["id_cliente"],
+                                             "campo": "cpf", "valor_no_documento": sens.mascarar("CPF", cpf),
+                                             "valor_na_base": sens.mascarar("CPF", cpf_base),
+                                             "situacao": "CPF citado no documento é diferente do CPF da pessoa na base"
+                                                         + ("" if v.cpf_valido(cpf) else " (e é inválido)")})
+                tel_base = v.somente_digitos(r.get("telefone") or "")[-9:]
+                for tel in telefones:
+                    if tel_base and v.somente_digitos(tel)[-9:] != tel_base:
+                        linhas_saida.append({"documento": doc.nome, "linha": numero, "pessoa": r["nome"], "id_cliente": r["id_cliente"],
+                                             "campo": "telefone", "valor_no_documento": sens.mascarar("Telefone", tel),
+                                             "valor_na_base": sens.mascarar("Telefone", r["telefone"]),
+                                             "situacao": "telefone citado no documento não é o telefone cadastrado"})
+    return pd.DataFrame(linhas_saida).drop_duplicates() if linhas_saida else pd.DataFrame()
 
 
 def _descrever_leitura(info: dict) -> list[str]:
@@ -419,8 +501,10 @@ def parecer_automatico(resumo: dict) -> str:
         for d in resumo["documentos"]:
             data = d["data"].strftime("%d/%m/%Y") if d["data"] else "sem data"
             linhas.append(f"- **{d['documento']}** — {d['tipo']} {d['numero']} ({data}). {d['objeto'][:150]}")
-        linhas += ["", "## Dossiês e continuação", ""]
-        for g in resumo["dossies"]:
+        dossies_reais = [g for g in resumo["dossies"] if len(g["documentos"]) > 1]
+        if dossies_reais or resumo["lacunas"]:
+            linhas += ["", "## Dossiês e continuação", ""]
+        for g in dossies_reais:
             linhas.append(f"- **{g['dossie']}** ({g['identificacao']}): " + " → ".join(g["documentos"]))
         if resumo["lacunas"]:
             linhas += ["", "**O que falta / próximos documentos esperados:**", ""]
@@ -483,6 +567,19 @@ def _parecer_inventario_e_base(resumo: dict) -> list[str]:
             linhas += [f"  - {k}: {'; '.join(o)}" for k, o in inv_["observacoes_de_leitura"].items()]
         linhas.append("")
     base = resumo.get("base_unica")
+    if resumo.get("suposicoes") or resumo.get("inconsistencias_docs_base") or (base and base.get("emails_com_acento")):
+        linhas += ["## ⚠️ Alertas e suposições para conferir", ""]
+        for s_ in resumo.get("suposicoes", []):
+            linhas.append(f"- **{s_['quantidade']}× {s_['suposicao']}** — {s_['onde']}")
+        if base and base.get("emails_com_acento"):
+            linhas.append(f"- E-mails com acento na base única: {', '.join(base['emails_com_acento'])} — "
+                          "tecnicamente válidos, mas muitos sistemas rejeitam; confirmar com o titular.")
+        for i in resumo.get("inconsistencias_docs_base", []):
+            quem = f"{i['pessoa']} (id {i['id_cliente']})" if i["pessoa"] else "pessoa não identificada"
+            base_txt = f"; na base: {i['valor_na_base']}" if i["valor_na_base"] else ""
+            linhas.append(f"- **{i['documento']}, linha {i['linha']}** — {quem}: {i['campo']} {i['valor_no_documento']}"
+                          f"{base_txt} → {i['situacao']}")
+        linhas.append("")
     if base:
         linhas += ["## Base única de pessoas", ""]
         linhas.append(f"- {base['registros_de_pessoas_lidos']} registros lidos em {len(base['por_fonte'])} fonte(s) → "
@@ -555,7 +652,8 @@ def gerar_excel(resultado: ResultadoAgente) -> bytes:
             abas.append((f"Base_unica_{_nome_base_pessoas(resultado)}", e.pessoas))
             abas += [(nome.capitalize(), df) for nome, df in e.transacoes.items()]
             abas += [("Conflitos_entre_fontes", e.conflitos), ("Correcoes_aplicadas", e.correcoes),
-                     ("Nao_vinculados", e.nao_vinculados), ("Fontes_avaliadas", e.fontes)]
+                     ("Nao_vinculados", e.nao_vinculados), ("Fontes_avaliadas", e.fontes),
+                     ("Docs_x_Base_inconsistencias", resultado.inconsistencias_docs_base)]
         abas += [
             ("Risco_LGPD", resultado.risco),
             ("Dados_sensiveis_LGPD", resultado.sensiveis),
@@ -610,6 +708,7 @@ def gerar_pacote_zip(resultado: ResultadoAgente) -> bytes:
             for nome, df in e.transacoes.items():
                 z.writestr(f"dados/{nome}.csv", csv(df))
             for nome, df in (("conflitos_entre_fontes", e.conflitos), ("correcoes_aplicadas", e.correcoes),
+                             ("inconsistencias_documentos_x_base", resultado.inconsistencias_docs_base),
                              ("nao_vinculados", e.nao_vinculados), ("fontes_avaliadas", e.fontes)):
                 if len(df):
                     z.writestr(f"relatorios/{nome}.csv", csv(df))

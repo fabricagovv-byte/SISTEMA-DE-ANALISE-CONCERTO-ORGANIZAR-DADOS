@@ -241,13 +241,17 @@ def normalizar_email(valor) -> tuple[str | None, str]:
     email = re.sub(r"@+", "@", original.lower().replace(" ", ""))
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-z]{2,}", email):
         return None, f"e-mail inválido ({original})"
+    alertas = []
     if "@@" in original:
-        alerta = "'@@' corrigido para '@'"
+        alertas.append("'@@' corrigido para '@'")
     elif original != original.lower():
-        alerta = "convertido para minúsculas"
-    else:
-        alerta = ""
-    return email, alerta
+        alertas.append("convertido para minúsculas")
+    if not email.isascii():
+        alertas.append(ALERTA_EMAIL_ACENTO)
+    return email, "; ".join(alertas)
+
+
+ALERTA_EMAIL_ACENTO = "e-mail com acento/caractere não-ASCII: válido pelo padrão (SMTPUTF8), mas muitos sistemas rejeitam"
 
 
 PARTICULAS = {"da", "de", "do", "das", "dos", "e", "di", "du", "van", "von"}

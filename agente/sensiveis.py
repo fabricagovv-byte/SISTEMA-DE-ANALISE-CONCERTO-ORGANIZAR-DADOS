@@ -117,6 +117,8 @@ def mascarar(tipo: str, valor: str) -> str:
         return f"***.{d[3:6]}.{d[6:9]}-**"
     if tipo == "CNPJ":
         return v.formatar_cnpj(valor)  # CNPJ é público
+    if tipo == "Telefone" and len(d) >= 8:
+        return f"(**) *****-{d[-4:]}"
     if tipo == "Cartão de crédito":
         return f"**** **** **** {d[-4:]}"
     if tipo in TIPOS_OCULTOS:

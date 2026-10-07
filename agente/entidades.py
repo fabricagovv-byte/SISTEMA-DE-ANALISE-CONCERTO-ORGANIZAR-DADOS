@@ -477,6 +477,8 @@ def consolidar(brutas: dict[str, pd.DataFrame], caminhos: dict[str, str] | None 
             obs.append(f"{len([r for r in rs if r['fonte'] == rs[0]['fonte']])} linhas duplicadas na fonte principal")
         if any(r["senha_exposta"] for r in rs):
             obs.append("senha em texto puro na origem (removida)")
+        if ouro.get("email") and not ouro["email"].isascii():
+            obs.append("e-mail com acento — pode ser rejeitado por outros sistemas; confirmar com o titular")
         ouro["observacoes"] = "; ".join(obs)
         pessoas.append(ouro)
 
@@ -521,6 +523,7 @@ def consolidar(brutas: dict[str, pd.DataFrame], caminhos: dict[str, str] | None 
         "conflitos": len(conflitos),
         "formatos_encontrados": formatos,
         "senhas_em_texto_puro": sum(1 for r in registros if r["senha_exposta"]),
+        "emails_com_acento": sorted(f"{e[:2]}***@{e.split('@', 1)[1]}" for e in pessoas_df["email"].dropna() if not e.isascii()),
     }
     fontes_df = pd.DataFrame([
         {"tabela": f.tabela, "caminho": f.caminho, "tipo": f.tipo, "prioridade": f.prioridade or None,
