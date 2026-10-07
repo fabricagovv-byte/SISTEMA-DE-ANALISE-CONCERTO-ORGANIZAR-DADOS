@@ -2,6 +2,14 @@
 
 Você sobe **documentos públicos** (PDF, Word, HTML, TXT, RTF) e **bases de dados** (CSV, Excel, JSON) — tudo junto — e o agente:
 
+### 🗂️ Pasta ou ZIP desorganizado (envie a pasta inteira compactada)
+- **Estrutura**: remove lixo (`Thumbs.db`, `~$` do Office, `.DS_Store`, vazios), acha **arquivos idênticos** (SHA-256) mesmo em pastas de backup, aponta nomes ruins (`Nova pasta (2)`, `sem título`, `final final`, `v2_AGORA_VAI`, `(cópia)`) com nome sugerido, e põe `.env`/`senhas*.txt`/chaves em **quarentena** (analisados, nunca copiados para a saída).
+- **Leitura robusta**: Latin-1 ou UTF-8, `;` ou `,`, cabeçalho fora da linha 1, título na A1, espaços no cabeçalho, linhas vazias e de TOTAL no meio, abas de rascunho, JSON com esquemas diferentes, acentos quebrados (`JoÃ£o` → `João`).
+- **Base única de pessoas**: junta o mesmo cliente/beneficiário vindo de vários arquivos (CPF, e-mail, nome ou ID, mesmo com colunas de nomes diferentes como `documento` = CPF), escolhe campo a campo o melhor valor válido da fonte mais confiável (backups antigos valem menos), **corrige CPF inválido com o valor válido de outra fonte** e lista todos os conflitos.
+- **Padronização**: datas ISO (detecta formato americano MM/DD e sinaliza datas ambíguas), CPF validado e formatado, telefone `+55 (DD) NNNNN-NNNN`, e-mail minúsculo e validado (`@@` corrigido), nomes e cidades padronizados (`POA` → Porto Alegre), sim/não, valores com moeda (R$/USD).
+- **Transações ligadas ao ID** (vendas, pedidos...): o cliente pode vir por ID, nome completo, só primeiro nome, e-mail ou objeto aninhado com CPF.
+- **Segredos**: senhas em texto puro, chaves de API, `.env`, strings de conexão, IP interno, **números de cartão (validados por Luhn)** — risco CRÍTICO, removidos de todas as saídas.
+
 ### 📄 Documentos públicos
 1. **Lê** PDF (texto e tabelas), DOCX (parágrafos e tabelas), HTML, TXT, MD e RTF. Tabelas encontradas dentro dos documentos entram no cruzamento de dados.
 2. **Organiza**: identifica o tipo (edital, contrato, termo aditivo, nota de empenho, ordem bancária, ata, portaria, decreto, ofício, parecer, relatório...), o órgão, número, data, objeto, valores, CNPJs, processos (SEI), contratos, licitações e empenhos citados.
@@ -33,6 +41,7 @@ streamlit run app.py
 
 # Ou pela linha de comando
 python -m agente exemplos/* -o resultado.xlsx     # gera resultado.xlsx e resultado.zip
+python -m agente pasta_baguncada/ -o resultado.xlsx   # uma pasta inteira (ou um .zip)
 ```
 
 Opções da linha de comando:
@@ -59,7 +68,9 @@ Sem a chave, tudo funciona com as regras automáticas. Modelo padrão: `claude-o
 
 ```
 agente/
-  leitor.py         leitura de CSV/Excel/JSON
+  inventario.py     pasta/ZIP: lixo, duplicatas, nomes ruins, quarentena de segredos
+  entidades.py      base única de pessoas, conflitos e transações ligadas ao ID
+  leitor.py         leitura de CSV/Excel/JSON (cabeçalho deslocado, TOTAL, rascunho, encoding)
   documentos.py     leitura de PDF/DOCX/HTML/TXT/RTF (texto + tabelas)
   organizador_docs.py  classificação, metadados, dossiês, continuação e lacunas
   sensiveis.py      dados pessoais/sensíveis (LGPD), risco e anonimização
@@ -70,7 +81,7 @@ agente/
   pipeline.py       orquestração e geração do Excel
 app.py              interface web (Streamlit)
 exemplos/           bases e documentos fictícios (edital, contrato, aditivo, empenho, ofício, relatório em partes)
-tests/              testes automáticos (python -m pytest)
+tests/              testes automáticos (python -m pytest), incl. teste de aceitação com banco_desorganizado.zip
 ```
 
 ## Regras do cruzamento

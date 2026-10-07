@@ -11,6 +11,8 @@ from typing import Callable
 import pandas as pd
 
 from . import agente_ia
+from . import entidades as ent
+from . import inventario as inv
 from . import sensiveis as sens
 from . import validadores as v
 from .documentos import EXTENSOES_DOCUMENTO, Documento, ler_documento, parece_texto_corrido
@@ -42,6 +44,8 @@ class ResultadoAgente:
     cruzamento_docs_dados: pd.DataFrame = field(default_factory=pd.DataFrame)
     documentos_anonimizados: dict[str, str] = field(default_factory=dict)
     tabelas_anonimizadas: dict[str, pd.DataFrame] = field(default_factory=dict)
+    inventario: pd.DataFrame = field(default_factory=pd.DataFrame)
+    entidades: ent.ResultadoEntidades | None = None
 
 
 def _nome_unico(nome: str, usados) -> str:
@@ -69,31 +73,56 @@ def executar(
     if usar_ia and not ia:
         registrar("⚠️ ANTHROPIC_API_KEY não configurada; seguindo só com regras automáticas.")
 
+    # 0. Inventário: abre ZIPs, separa lixo, duplicatas e arquivos de credenciais.
+    itens = inv.analisar(inv.expandir(arquivos))
+    for item in itens:
+        if item.categoria in {"lixo", "vazio", "duplicata"}:
+            registrar(f"🗑️ {item.caminho}: {item.situacao}")
+        elif item.categoria == "segredo":
+            registrar(f"🚨 {item.caminho}: {item.situacao}")
+
     # 1. Leitura: planilhas viram tabelas; PDF/Word/HTML/TXT corrido viram documentos.
     brutas: dict[str, pd.DataFrame] = {}
+    caminhos: dict[str, str] = {}
     documentos: dict[str, Documento] = {}
-    for nome, conteudo in arquivos:
-        extensao = Path(nome).suffix.lower()
+    segredos: dict[str, Documento] = {}
+    for item in itens:
+        if item.categoria not in {"dados", "documento", "segredo"}:
+            continue
+        nome, conteudo = item.caminho, item.conteudo
+        extensao = item.extensao
         try:
-            if extensao in EXTENSOES_DOCUMENTO or (extensao == ".txt" and parece_texto_corrido(conteudo)):
+            eh_documento = extensao in EXTENSOES_DOCUMENTO or (extensao == ".txt" and parece_texto_corrido(conteudo))
+            if item.categoria == "segredo" or eh_documento:
                 doc = ler_documento(nome, conteudo)
+                doc.texto = v.corrigir_mojibake(doc.texto)
+                doc.paginas = [v.corrigir_mojibake(p) for p in doc.paginas]
+                if item.categoria == "segredo":
+                    doc.nome = _nome_unico(item.caminho, segredos)
+                    segredos[doc.nome] = doc
+                    continue
                 doc.nome = _nome_unico(doc.nome, documentos)
                 documentos[doc.nome] = doc
                 registrar(f"📄 {doc.nome}: documento com {len(doc.paginas)} página(s), {len(doc.texto)} caracteres")
                 for aviso in doc.avisos:
                     registrar(f"⚠️ {doc.nome}: {aviso}")
+                    item.observacoes.append(aviso)
                 for i, df in enumerate(doc.tabelas, start=1):
                     chave = _nome_unico(f"{doc.nome}__tabela{i}", brutas)
                     brutas[chave] = df
+                    caminhos[chave] = item.caminho
                     registrar(f"📥 {chave}: tabela extraída do documento ({len(df)} linhas)")
             else:
                 for tabela, df in ler_arquivo(nome, conteudo).items():
                     chave = _nome_unico(tabela, brutas)
                     brutas[chave] = df
+                    caminhos[chave] = item.caminho
+                    item.observacoes += _descrever_leitura(df.attrs.get("leitura", {}))
                     registrar(f"📥 {chave}: {len(df)} linhas × {len(df.columns)} colunas")
         except Exception as erro:  # arquivo corrompido não deve derrubar os demais
             registrar(f"⚠️ Não foi possível ler '{nome}': {erro}")
-    if not brutas and not documentos:
+            item.observacoes.append(f"erro de leitura: {erro}")
+    if not brutas and not documentos and not segredos:
         raise ValueError("Nenhum arquivo pôde ser lido.")
 
     # 2. Entendimento das colunas pela IA (opcional)
@@ -131,12 +160,15 @@ def executar(
     for doc in documentos.values():
         achados += sens.encontrar_em_texto(doc.texto, doc.nome, doc.paginas)
         documentos_anonimizados[doc.nome] = sens.anonimizar_texto(doc.texto)
+    for doc in segredos.values():
+        achados += sens.encontrar_em_texto(doc.texto, doc.nome, doc.paginas)
     sensiveis = pd.DataFrame(achados) if achados else pd.DataFrame(columns=COLUNAS_SENSIVEIS + ["_valor"])
-    risco = _risco_por_origem(sensiveis, list(brutas) + list(documentos))
+    risco = _risco_por_origem(sensiveis, list(brutas) + list(documentos) + list(segredos))
     if len(sensiveis):
         registrar(
-            f"🔒 {int((sensiveis['categoria'] != 'empresa').sum())} ocorrência(s) de dados pessoais/sensíveis; "
-            f"{int((risco['risco'] == 'ALTO').sum())} arquivo(s) com risco ALTO."
+            f"🔒 {int((sensiveis['categoria'] != 'empresa').sum())} ocorrência(s) de dados pessoais/sensíveis/credenciais; "
+            f"{int((risco['risco'] == 'CRÍTICO').sum())} arquivo(s) CRÍTICO(s), "
+            f"{int((risco['risco'] == 'ALTO').sum())} com risco ALTO."
         )
 
     # 5. Organização dos documentos e continuação entre eles
@@ -170,10 +202,26 @@ def executar(
             f"{len(vinculos)} vínculo(s) de continuação; {len(lacunas)} lacuna(s)."
         )
 
-    # 6. Sincronização das tabelas
-    sinc = sincronizar(tabelas, chave_forcada=chave_forcada)
-    for obs in sinc.observacoes:
-        registrar(f"🔗 {obs}")
+    # 6. Base única de pessoas + transações ligadas ao ID (quando há cadastros);
+    #    senão, cruzamento genérico das tabelas por chave comum.
+    entidades = ent.consolidar(brutas, caminhos) if brutas else None
+    if entidades is not None:
+        r = entidades.resumo
+        registrar(
+            f"👥 Base única: {r['registros_de_pessoas_lidos']} registros de pessoas → {r['pessoas_unicas']} pessoas "
+            f"({r['cpf_corrigido_por_outra_fonte']} CPF(s) corrigido(s) por outra fonte, "
+            f"{r['cpf_invalido_sem_correcao']} inválido(s) sem correção, {r['conflitos']} conflito(s))."
+        )
+        for nome_t, info in r["transacoes"].items():
+            registrar(f"🔗 {nome_t}: {info['vinculadas']}/{info['linhas']} registros ligados ao ID da pessoa.")
+        vazio = pd.DataFrame()
+        sinc = ResultadoSincronizacao(None, vazio, vazio, vazio, observacoes=[
+            "Cruzamento feito pela base única de pessoas (ver abas Base_unica e transações)."
+        ])
+    else:
+        sinc = sincronizar(tabelas, chave_forcada=chave_forcada)
+        for obs in sinc.observacoes:
+            registrar(f"🔗 {obs}")
     cruzamento = _cruzar_documentos_e_dados(sensiveis, fichas_obj, tabelas)
     if len(cruzamento):
         registrar(f"🔗 {len(cruzamento)} CPF/CNPJ citado(s) em documentos também aparece(m) nas tabelas.")
@@ -182,11 +230,18 @@ def executar(
     if len(dicionario):
         marcas = {(a["origem"], a["pagina_ou_coluna"]): f"{a['categoria']}: {a['tipo']}" for a in achados}
         dicionario["dado_pessoal_lgpd"] = [marcas.get((t, c), "") for t, c in zip(dicionario["tabela"], dicionario["coluna"])]
+        # Exemplos de colunas pessoais/secretas não podem aparecer no dicionário de dados.
+        marcadas = dicionario["dado_pessoal_lgpd"].ne("") & ~dicionario["dado_pessoal_lgpd"].str.startswith("empresa")
+        dicionario.loc[marcadas, "exemplos"] = "[oculto: " + dicionario.loc[marcadas, "dado_pessoal_lgpd"] + "]"
     problemas = pd.DataFrame([p for t in tabelas for p in t.problemas])
     if problemas.empty:
         problemas = pd.DataFrame(columns=["tabela", "linha", "coluna", "valor_original", "problema"])
 
+    inventario_df = inv.tabela(itens)
     resumo = montar_resumo(tabelas, sinc, problemas, descricoes, fichas, dossies, lacunas, sensiveis, risco)
+    resumo["inventario"] = _resumo_inventario(itens)
+    if entidades is not None:
+        resumo["base_unica"] = entidades.resumo
     parecer = parecer_automatico(resumo)
     if ia:
         registrar("🤖 IA redigindo o parecer...")
@@ -208,7 +263,45 @@ def executar(
         cruzamento_docs_dados=cruzamento,
         documentos_anonimizados=documentos_anonimizados,
         tabelas_anonimizadas=tabelas_anonimizadas,
+        inventario=inventario_df,
+        entidades=entidades,
     )
+
+
+def _descrever_leitura(info: dict) -> list[str]:
+    obs = []
+    if info.get("formato") in {"CSV", "JSON"}:
+        obs.append(f"{info['formato']} em {info.get('codificacao')}" + (f", separador '{info['separador']}'" if info.get("separador") else "")
+                   + " → saída em UTF-8")
+    if info.get("cabecalho_na_linha"):
+        obs.append(f"cabeçalho na linha {info['cabecalho_na_linha']} (título ignorado: '{info.get('titulo_ignorado', '')}')")
+    if info.get("cabecalhos_corrigidos"):
+        obs.append("cabeçalho com espaços sobrando: " + ", ".join(repr(c) for c in info["cabecalhos_corrigidos"]))
+    if info.get("linhas_vazias_removidas"):
+        obs.append(f"{info['linhas_vazias_removidas']} linha(s) vazia(s) removida(s)")
+    if info.get("linhas_total_removidas"):
+        obs.append(f"{info['linhas_total_removidas']} linha(s) de TOTAL no meio dos dados removida(s)")
+    if info.get("abas_descartadas"):
+        obs.append("aba(s) descartada(s): " + ", ".join(info["abas_descartadas"]))
+    if info.get("esquemas_diferentes", 1) > 1:
+        obs.append(f"{info['esquemas_diferentes']} esquemas de chaves diferentes unificados")
+    if info.get("ids_tipos_misturados"):
+        obs.append("IDs ora número, ora texto (" + ", ".join(f"{k}: {'/'.join(t)}" for k, t in info["ids_tipos_misturados"].items())
+                   + ") → padronizados como texto")
+    return obs
+
+
+def _resumo_inventario(itens) -> dict:
+    return {
+        "arquivos": len(itens),
+        "removidos": [f"{i.caminho} — {i.situacao}" for i in itens if i.categoria in {"lixo", "vazio", "duplicata"}],
+        "quarentena": [i.caminho for i in itens if i.categoria == "segredo"],
+        "nomes_ruins": [
+            f"{i.caminho}: {'; '.join(dict.fromkeys(i.problemas_nome))}" + (f" → sugerido '{i.nome_sugerido}'" if i.nome_sugerido else "")
+            for i in itens if i.problemas_nome
+        ],
+        "observacoes_de_leitura": {i.caminho: i.observacoes for i in itens if i.observacoes},
+    }
 
 
 def _risco_por_origem(sensiveis: pd.DataFrame, origens: list[str]) -> pd.DataFrame:
@@ -224,6 +317,8 @@ def _risco_por_origem(sensiveis: pd.DataFrame, origens: list[str]) -> pd.DataFra
             "criancas_adolescentes": int((doc["categoria"] == "crianca").sum()) if len(doc) else 0,
             "tipos_encontrados": ", ".join(sorted(set(doc["tipo"]))) if len(doc) else "",
             "recomendacao": {
+                "CRÍTICO": "Retirar o arquivo da pasta compartilhada; TROCAR as senhas/chaves expostas; guardar segredos "
+                           "em cofre de senhas; nunca guardar número completo de cartão (PCI-DSS).",
                 "ALTO": "Restringir acesso; publicar só a versão anonimizada; verificar base legal (LGPD art. 11).",
                 "MÉDIO": "Publicar com CPF mascarado e sem contatos/endereço (LGPD art. 6º, III).",
                 "BAIXO": "Sem dados pessoais detectados.",
@@ -282,6 +377,11 @@ def montar_resumo(
         "dados_pessoais_lgpd": {
             "ocorrencias_por_tipo": pessoais["tipo"].value_counts().to_dict() if len(pessoais) else {},
             "risco_por_arquivo": risco[["arquivo", "risco"]].to_dict("records") if len(risco) else [],
+            "criticos": [
+                f"{r['origem']} — {r['tipo']}" + (f" (coluna '{r['pagina_ou_coluna']}', {r['contexto']})"
+                                                  if isinstance(r["pagina_ou_coluna"], str) else f": {r['contexto']}")
+                for r in sensiveis.to_dict("records") if r["categoria"] in {"credencial", "financeiro", "infraestrutura"}
+            ] if len(sensiveis) else [],
         },
         "tabelas": [
             {
@@ -313,6 +413,7 @@ def montar_resumo(
 
 def parecer_automatico(resumo: dict) -> str:
     linhas = ["# Parecer do processamento", ""]
+    linhas += _parecer_inventario_e_base(resumo)
     if resumo["documentos"]:
         linhas += ["## Documentos recebidos", ""]
         for d in resumo["documentos"]:
@@ -328,6 +429,10 @@ def parecer_automatico(resumo: dict) -> str:
     lgpd = resumo["dados_pessoais_lgpd"]
     if lgpd["risco_por_arquivo"]:
         linhas += ["## Dados pessoais e sensíveis (LGPD)", ""]
+        if lgpd.get("criticos"):
+            linhas.append("**🚨 Achados críticos (credenciais, senhas e cartões expostos):**")
+            linhas += [f"- {c}" for c in lgpd["criticos"]]
+            linhas.append("")
         if lgpd["ocorrencias_por_tipo"]:
             linhas.append("- Encontrados: " + ", ".join(f"{t} ({n})" for t, n in lgpd["ocorrencias_por_tipo"].items()))
         for r in lgpd["risco_por_arquivo"]:
@@ -337,7 +442,7 @@ def parecer_automatico(resumo: dict) -> str:
         linhas.append("")
     if not resumo["tabelas"]:
         return "\n".join(linhas)
-    linhas += ["## Bases recebidas", ""]
+    linhas += ["## Bases recebidas (limpeza linha a linha, antes da unificação)", ""]
     for t in resumo["tabelas"]:
         linhas.append(
             f"- **{t['nome']}**: {t['linhas_originais']} linhas → {t['linhas_finais']} após limpeza "
@@ -360,6 +465,72 @@ def parecer_automatico(resumo: dict) -> str:
     return "\n".join(linhas)
 
 
+def _parecer_inventario_e_base(resumo: dict) -> list[str]:
+    linhas = []
+    inv_ = resumo.get("inventario") or {}
+    if inv_:
+        linhas += ["## Estrutura de pastas e arquivos", "", f"- {inv_['arquivos']} arquivo(s) recebido(s)."]
+        if inv_["removidos"]:
+            linhas.append("- **Removidos da saída (lixo, vazios, duplicatas):**")
+            linhas += [f"  - {x}" for x in inv_["removidos"]]
+        if inv_["quarentena"]:
+            linhas.append("- **🚨 Em quarentena (credenciais — NÃO copiados para a saída):** " + ", ".join(inv_["quarentena"]))
+        if inv_["nomes_ruins"]:
+            linhas.append("- **Nomes de arquivo/pasta problemáticos:**")
+            linhas += [f"  - {x}" for x in inv_["nomes_ruins"]]
+        if inv_["observacoes_de_leitura"]:
+            linhas.append("- **Problemas de formato corrigidos na leitura:**")
+            linhas += [f"  - {k}: {'; '.join(o)}" for k, o in inv_["observacoes_de_leitura"].items()]
+        linhas.append("")
+    base = resumo.get("base_unica")
+    if base:
+        linhas += ["## Base única de pessoas", ""]
+        linhas.append(f"- {base['registros_de_pessoas_lidos']} registros lidos em {len(base['por_fonte'])} fonte(s) → "
+                      f"**{base['pessoas_unicas']} pessoas únicas**, sem duplicatas.")
+        for nome, f in base["por_fonte"].items():
+            linhas.append(f"  - {nome}: {f['linhas']} linhas, {f['pessoas_distintas']} pessoas"
+                          f" ({f['duplicatas_internas']} duplicata(s) interna(s)) — confiabilidade {f['prioridade']}: {f['avaliacao']}")
+        linhas.append(f"- CPF: {base['cpf_corrigido_por_outra_fonte']} corrigido(s) com o valor válido de outra fonte; "
+                      f"{base['cpf_invalido_sem_correcao']} continua(m) inválido(s) — conferir com o titular.")
+        linhas.append(f"- {base['conflitos']} divergência(s) entre fontes resolvida(s) e listada(s) na aba Conflitos "
+                      "(valores de backups antigos foram descartados).")
+        if base.get("senhas_em_texto_puro"):
+            linhas.append(f"- 🚨 {base['senhas_em_texto_puro']} registro(s) com **senha em texto puro** — coluna removida de todas as saídas.")
+        for nome, t in base["transacoes"].items():
+            linhas.append(f"- **{nome}**: {t['vinculadas']} de {t['linhas']} registros ligados ao ID da pessoa.")
+        if base.get("formatos_encontrados"):
+            linhas += ["", "**Formatos encontrados na origem (todos padronizados na saída):**", ""]
+            padrao = {"cpf": "000.000.000-00 com dígito validado", "nascimento": "AAAA-MM-DD (ISO)",
+                      "data": "AAAA-MM-DD (ISO)", "telefone": "+55 (DD) NNNNN-NNNN", "email": "minúsculas, validado",
+                      "nome": "Nome Próprio", "valor": "número + coluna moeda", "pago": "sim / não / não informado",
+                      "cliente": "id_cliente", "status": "minúsculas; '?' vira '(a confirmar)'"}
+            for fonte, campos in base["formatos_encontrados"].items():
+                for campo, contagem in campos.items():
+                    if len(contagem) > 1:
+                        detalhe = ", ".join(f"{k} ({n})" for k, n in contagem.items())
+                        linhas.append(f"- {fonte} · **{campo}**: {len(contagem)} formatos — {detalhe} → {padrao.get(campo, '')}")
+        linhas.append("")
+    return linhas
+
+
+def _sem_segredos(df: pd.DataFrame, origem: str, sensiveis: pd.DataFrame) -> pd.DataFrame:
+    """Remove colunas com senha/cartão antes de qualquer exportação."""
+    if not len(sensiveis):
+        return df
+    ruins = sensiveis[(sensiveis["origem"] == origem) & sensiveis["categoria"].isin(["credencial", "financeiro"])]
+    return df.drop(columns=[c for c in ruins["pagina_ou_coluna"] if c in df.columns])
+
+
+def _nome_base_pessoas(resultado: ResultadoAgente) -> str:
+    fontes = resultado.entidades.fontes if resultado.entidades is not None else pd.DataFrame()
+    nomes = " ".join(fontes[fontes["tipo"] == "pessoas"]["tabela"]).lower() if len(fontes) else ""
+    for chave, nome in (("client", "clientes"), ("benefici", "beneficiarios"), ("servidor", "servidores"),
+                        ("aluno", "alunos"), ("paciente", "pacientes"), ("fornecedor", "fornecedores")):
+        if chave in nomes:
+            return nome
+    return "pessoas"
+
+
 def _nome_aba(nome: str, usados: set[str]) -> str:
     base = re.sub(r"[\[\]:*?/\\]", "_", nome)[:28] or "aba"
     candidato, n = base, 2
@@ -378,13 +549,20 @@ def gerar_excel(resultado: ResultadoAgente) -> bytes:
     with pd.ExcelWriter(saida, engine="openpyxl", datetime_format="DD/MM/YYYY", date_format="DD/MM/YYYY") as escritor:
         resumo = pd.DataFrame({"parecer": resultado.parecer.splitlines()})
         resumo.to_excel(escritor, sheet_name=_nome_aba("Resumo", usados), index=False)
-        abas = [
+        abas = [("Inventario_arquivos", resultado.inventario)]
+        e = resultado.entidades
+        if e is not None:
+            abas.append((f"Base_unica_{_nome_base_pessoas(resultado)}", e.pessoas))
+            abas += [(nome.capitalize(), df) for nome, df in e.transacoes.items()]
+            abas += [("Conflitos_entre_fontes", e.conflitos), ("Correcoes_aplicadas", e.correcoes),
+                     ("Nao_vinculados", e.nao_vinculados), ("Fontes_avaliadas", e.fontes)]
+        abas += [
+            ("Risco_LGPD", resultado.risco),
+            ("Dados_sensiveis_LGPD", resultado.sensiveis),
             ("Documentos", resultado.fichas),
             ("Dossies", resultado.dossies),
             ("Continuacao_vinculos", resultado.vinculos),
             ("Lacunas", resultado.lacunas),
-            ("Dados_sensiveis_LGPD", resultado.sensiveis),
-            ("Risco_LGPD", resultado.risco),
             ("Docs_x_Tabelas", resultado.cruzamento_docs_dados),
             ("Consolidado", sinc.consolidado),
             ("Cobertura", sinc.cobertura),
@@ -392,7 +570,7 @@ def gerar_excel(resultado: ResultadoAgente) -> bytes:
             ("Problemas", resultado.problemas),
             ("Dicionario", resultado.dicionario),
         ]
-        abas += [(f"Limpo_{t.nome}", t.dados) for t in resultado.tabelas]
+        abas += [(f"Limpo_{t.nome}", _sem_segredos(t.dados, t.nome, resultado.sensiveis)) for t in resultado.tabelas]
         for nome, df in abas:
             if df is None or df.empty:
                 continue
@@ -406,23 +584,47 @@ def gerar_excel(resultado: ResultadoAgente) -> bytes:
 
 
 def gerar_pacote_zip(resultado: ResultadoAgente) -> bytes:
-    """ZIP com parecer, CSVs limpos e versões ANONIMIZADAS de documentos e tabelas (prontas para publicar)."""
+    """ZIP organizado, em UTF-8, sem lixo, sem duplicatas e sem credenciais:
+
+    dados/            base única de pessoas e transações ligadas ao ID
+    relatorios/       parecer, inventário, conflitos, correções, dados sensíveis, risco
+    anonimizado/      versões prontas para publicação (documentos e tabelas)
+    limpo_por_fonte/  cada tabela de origem padronizada (sem colunas de senha/cartão)
+    texto_extraido/   texto dos documentos sem dados pessoais (risco BAIXO)
+    """
     import zipfile
 
     def csv(df: pd.DataFrame) -> bytes:
         return df.to_csv(index=False, sep=";").encode("utf-8-sig")
 
     pacote = io.BytesIO()
+    risco = dict(zip(resultado.risco.get("arquivo", []), resultado.risco.get("risco", [])))
     with zipfile.ZipFile(pacote, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("parecer.md", resultado.parecer)
+        z.writestr("LEIA-ME.md", gerar_pacote_zip.__doc__.split("\n", 2)[2].replace("    ", ""))
+        z.writestr("relatorios/parecer.md", resultado.parecer)
+        if len(resultado.inventario):
+            z.writestr("relatorios/inventario_arquivos.csv", csv(resultado.inventario))
+        e = resultado.entidades
+        if e is not None:
+            z.writestr(f"dados/{_nome_base_pessoas(resultado)}.csv", csv(e.pessoas))
+            for nome, df in e.transacoes.items():
+                z.writestr(f"dados/{nome}.csv", csv(df))
+            for nome, df in (("conflitos_entre_fontes", e.conflitos), ("correcoes_aplicadas", e.correcoes),
+                             ("nao_vinculados", e.nao_vinculados), ("fontes_avaliadas", e.fontes)):
+                if len(df):
+                    z.writestr(f"relatorios/{nome}.csv", csv(df))
+        if len(resultado.sensiveis):
+            z.writestr("relatorios/dados_sensiveis.csv", csv(resultado.sensiveis))
+            z.writestr("relatorios/risco_lgpd.csv", csv(resultado.risco))
         if len(resultado.sincronizacao.consolidado):
-            z.writestr("consolidado.csv", csv(resultado.sincronizacao.consolidado))
+            z.writestr("dados/consolidado.csv", csv(resultado.sincronizacao.consolidado))
         for t in resultado.tabelas:
-            z.writestr(f"limpo/{t.nome}.csv", csv(t.dados))
+            z.writestr(f"limpo_por_fonte/{t.nome}.csv", csv(_sem_segredos(t.dados, t.nome, resultado.sensiveis)))
         for nome, df in resultado.tabelas_anonimizadas.items():
             z.writestr(f"anonimizado/tabelas/{nome}.csv", csv(df))
         for nome, texto in resultado.documentos_anonimizados.items():
             z.writestr(f"anonimizado/documentos/{nome}.txt", texto)
         for doc in resultado.documentos:
-            z.writestr(f"texto_extraido/{doc.nome}.txt", doc.texto)
+            if risco.get(doc.nome, "BAIXO") == "BAIXO":
+                z.writestr(f"texto_extraido/{doc.nome}.txt", doc.texto)
     return pacote.getvalue()

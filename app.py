@@ -7,6 +7,7 @@ import streamlit as st
 
 from agente import executar, gerar_excel, gerar_pacote_zip
 from agente.agente_ia import ia_disponivel
+from agente.pipeline import _sem_segredos
 
 st.set_page_config(page_title="Agente de Dados do Governo", page_icon="🏛️", layout="wide")
 st.title("🏛️ Agente de Organização e Sincronização de Dados")
@@ -34,7 +35,8 @@ with st.sidebar:
 
 arquivos = st.file_uploader(
     "Documentos e arquivos de dados",
-    type=["pdf", "docx", "html", "htm", "txt", "md", "rtf", "csv", "xlsx", "xlsm", "xls", "json"],
+    type=["zip", "pdf", "docx", "html", "htm", "txt", "md", "rtf", "csv", "xlsx", "xlsm", "xls", "json"],
+    help="Pode enviar uma pasta inteira compactada em .zip: o agente olha a estrutura, remove lixo e duplicatas.",
     accept_multiple_files=True,
 )
 
@@ -56,12 +58,15 @@ if arquivos and st.button("▶️ Processar", type="primary"):
 resultado = st.session_state.get("resultado")
 if resultado:
     sinc = resultado.sincronizacao
+    e = resultado.entidades
+    inv_ = resultado.inventario
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Documentos", len(resultado.documentos))
-    c2.metric("Dossiês", resultado.dossies["dossie"].nunique() if len(resultado.dossies) else 0)
-    c3.metric("Lacunas (o que falta)", len(resultado.lacunas))
-    c4.metric("Arquivos risco ALTO (LGPD)", int((resultado.risco["risco"] == "ALTO").sum()) if len(resultado.risco) else 0)
-    c5.metric("Registros consolidados", len(sinc.consolidado))
+    c1.metric("Arquivos recebidos", len(inv_))
+    c2.metric("Removidos (lixo/duplicata)", int(inv_["situacao"].str.startswith("REMOVER").sum()) if len(inv_) else 0)
+    c3.metric("Pessoas únicas", len(e.pessoas) if e is not None else len(sinc.consolidado))
+    criticos = int(resultado.risco["risco"].isin(["CRÍTICO", "ALTO"]).sum()) if len(resultado.risco) else 0
+    c4.metric("Arquivos risco CRÍTICO/ALTO", criticos)
+    c5.metric("Documentos", len(resultado.documentos))
 
     b1, b2 = st.columns(2)
     b1.download_button(
@@ -77,10 +82,25 @@ if resultado:
         file_name="resultado.zip",
     )
 
+    if e is not None:
+        st.subheader("👥 Base única")
+        aba_base = st.tabs(["Pessoas", *[n.capitalize() for n in e.transacoes], "Conflitos entre fontes", "Correções aplicadas"])
+        with aba_base[0]:
+            st.dataframe(e.pessoas, width="stretch")
+        for i, df in enumerate(e.transacoes.values(), start=1):
+            with aba_base[i]:
+                st.dataframe(df, width="stretch")
+        with aba_base[-2]:
+            st.dataframe(e.conflitos, width="stretch")
+        with aba_base[-1]:
+            st.dataframe(e.correcoes, width="stretch")
+
     abas = st.tabs([
         "Parecer", "Documentos", "Dossiês e continuação", "Dados sensíveis (LGPD)",
-        "Consolidado", "Divergências", "Problemas", "Dicionário", "Tabelas limpas",
+        "Consolidado", "Divergências", "Problemas", "Dicionário", "Tabelas limpas", "Arquivos (inventário)",
     ])
+    with abas[9]:
+        st.dataframe(resultado.inventario, width="stretch")
     with abas[0]:
         st.markdown(resultado.parecer)
     with abas[1]:
@@ -120,4 +140,4 @@ if resultado:
             with st.expander(f"{t.nome} — {len(t.dados)} linhas"):
                 if t.nome in resultado.descricoes:
                     st.caption(resultado.descricoes[t.nome])
-                st.dataframe(t.dados, width="stretch")
+                st.dataframe(_sem_segredos(t.dados, t.nome, resultado.sensiveis), width="stretch")

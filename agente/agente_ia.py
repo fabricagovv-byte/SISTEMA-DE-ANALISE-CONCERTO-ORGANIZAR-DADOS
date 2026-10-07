@@ -65,10 +65,16 @@ def ia_disponivel() -> bool:
     return any(os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"))
 
 
+COLUNAS_SECRETAS = re.compile(r"senha|password|passwd|pwd|secret|token|api_?key|cart[aã]o|card", re.IGNORECASE)
+
+
 def _mascarar(valor: str) -> str:
     texto = str(valor)
-    # Sequências com 8+ dígitos (CPF, CNPJ, NIS, telefone, conta) viram ###.
-    return re.sub(r"\d[\d.\-/ ]{6,}\d", lambda m: "#" * len(m.group()), texto)[:60]
+    # Sequências com 8+ dígitos (CPF, CNPJ, NIS, telefone, conta, cartão) viram ###.
+    texto = re.sub(r"\d[\d.\-/ ]{6,}\d", lambda m: "#" * len(m.group()), texto)
+    # E-mails: mantém só o domínio.
+    texto = re.sub(r"[\w.+-]+@([\w-]+\.[\w.-]+)", r"***@\1", texto)
+    return texto[:60]
 
 
 def _descrever(tabelas_brutas: dict[str, pd.DataFrame]) -> str:
@@ -76,6 +82,9 @@ def _descrever(tabelas_brutas: dict[str, pd.DataFrame]) -> str:
     for nome, df in tabelas_brutas.items():
         colunas = []
         for coluna in df.columns:
+            if COLUNAS_SECRETAS.search(str(coluna)):
+                colunas.append({"coluna": str(coluna), "exemplos": ["[oculto: possível senha/cartão]"]})
+                continue
             exemplos = [
                 _mascarar(x) for x in df[coluna].astype(str).str.strip().replace("", pd.NA).dropna().unique()[:5]
             ]

@@ -94,6 +94,8 @@ def detectar_tipo(coluna: str, serie: pd.Series) -> str:
     tem_simbolo_moeda = amostra.str.contains(r"R\$|,\d{2}$", regex=True).mean() > 0.5
     if (eh_numero > 0.9 and tem_simbolo_moeda) or (eh_numero > 0.6 and _tem_pista(coluna, "valor")):
         return "valor"
+    if (tamanhos >= 12).mean() > 0.5:
+        return "texto"  # cartões, protocolos, chaves: números longos não são quantidades
     if amostra.str.fullmatch(r"-?\d+([.,]\d+)?").mean() > 0.95:
         # Códigos com zero à esquerda (ex.: matrícula "00123") são texto, não número.
         if amostra.str.match(r"^0\d").any():
@@ -174,6 +176,8 @@ def _limpar_coluna(serie: pd.Series, tipo: str, tabela: str, coluna: str, proble
         resultado = pd.to_datetime(resultado, errors="coerce")
     elif tipo in {"valor", "numero"}:
         resultado = pd.to_numeric(resultado, errors="coerce")
+        if tipo == "numero" and resultado.notna().any() and (resultado.dropna() % 1 == 0).all():
+            resultado = resultado.astype("Int64")  # IDs e contagens: 1, não 1.0
     return resultado
 
 

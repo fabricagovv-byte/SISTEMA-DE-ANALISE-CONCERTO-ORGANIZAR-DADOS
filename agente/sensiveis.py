@@ -6,6 +6,9 @@ Categorias:
                 opinião política, filiação sindical, vida sexual, biometria/genética.
 - "crianca"   : indício de dado de criança/adolescente (art. 14).
 - "empresa"   : identificador de pessoa jurídica (CNPJ) — público, listado só para cruzamento.
+- "credencial": senha, chave de API, segredo, string de conexão — nunca deveria estar em arquivo aberto.
+- "financeiro": número de cartão de pagamento (validado pelo algoritmo de Luhn) — PCI-DSS.
+- "infraestrutura": endereço IP interno de servidor.
 """
 
 from __future__ import annotations
@@ -43,6 +46,13 @@ def _cns_valido(valor: str) -> bool:
     return sum(int(a) * (15 - i) for i, a in enumerate(d)) % 11 == 0
 
 
+def _cartao_valido(valor: str) -> bool:
+    d = v.somente_digitos(valor)
+    if not 13 <= len(d) <= 19 or d[0] not in "23456" or (len(d) == 14 and v.cnpj_valido(d)):
+        return False
+    return v.luhn_valido(d)
+
+
 def _f(padrao: str) -> re.Pattern:
     return re.compile(padrao, re.IGNORECASE)
 
@@ -57,7 +67,7 @@ REGRAS: tuple[Regra, ...] = (
     Regra("RG", "pessoal", _f(r"\b(?:RG|R\.G\.|identidade|carteira de identidade)" + CTX + r"(\d[\dXx.\-]{4,13}(?:\s?-?\s?(?:SSP|SDS|DETRAN|IFP|PC)\s?/?\s?[A-Z]{2})?)"), None, 1),
     Regra("Nome de pessoa", "pessoal", re.compile(
         r"(?:\b(?:[Ss]r\.?|[Ss]ra\.?|[Ss]enhora?|[Rr]epresentad[oa] por|[Ss]ervidora?|[Bb]enefici[áa]ri[oa]|"
-        r"[Rr]equerente|[Ii]nteressad[oa]|[Pp]aciente|[Nn]ome(?: completo)?\s*:|[Ff]ilh[oa] de|[Mm][ãa]e\s*:|[Pp]ai\s*:)\s+)"
+        r"[Rr]equerente|[Ii]nteressad[oa]|[Pp]aciente|[Ll]igar (?:p/|para|pr[oa])|[Ff]alar com|[Cc]ontato\s*:?|[Cc]liente\s*:|[Nn]ome(?: completo)?\s*:|[Ff]ilh[oa] de|[Mm][ãa]e\s*:|[Pp]ai\s*:)\s+)"
         r"([A-ZÀ-Ú][a-zà-ú]+(?:\s+(?:d[aeo]s?\s+)?[A-ZÀ-Ú][a-zà-ú]+){1,5})"), None, 1),
     Regra("CNH", "pessoal", _f(r"\b(?:CNH|habilita[çc][ãa]o)" + CTX + r"(\d{9,11})\b"), None, 1),
     Regra("Título de eleitor", "pessoal", _f(r"t[íi]tulo de eleitor" + CTX + r"(\d{4}\s?\d{4}\s?\d{4})"), None, 1),
@@ -78,8 +88,26 @@ REGRAS: tuple[Regra, ...] = (
     Regra("Filiação sindical", "sensivel", _f(r"\b(?:filia[çc][ãa]o sindical|sindicalizad[oa]|filiad[oa] ao sindicato)\b")),
     Regra("Vida sexual / orientação", "sensivel", _f(r"\b(?:orienta[çc][ãa]o sexual|homossexual|bissexual|transexual|identidade de g[êe]nero|nome social)\b")),
     Regra("Biometria / genética", "sensivel", _f(r"\b(?:biometria|impress[ãa]o digital|reconhecimento facial|dados gen[ée]ticos|DNA)\b")),
+    # Credenciais e segredos
+    Regra("Chave privada", "credencial", _f(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    Regra("Chave de API", "credencial", re.compile(
+        r"\b((?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9_]{8,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|"
+        r"xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_\-]{35})\b"), None, 1),
+    Regra("Chave de API", "credencial", _f(r"\b(?:api[_-]?key|apikey|chave[_ ](?:de[_ ])?api|access[_-]?key)\w*\s*[:=]\s*([^\s,;]+)"), None, 1),
+    Regra("Senha/segredo em texto puro", "credencial", _f(
+        r"\b(?:senha|password|passwd|pwd|pass|secret|segredo|token|[a-z_]*_(?:password|secret|token|pass))\b\s*[:=]\s*([^\s,;]+)"), None, 1),
+    Regra("Usuário e senha (par)", "credencial", _f(
+        r"(?m)^[ \t]*(?:admin|root|administrador|user|usu[áa]rio|login|sa)[ \t]*/[ \t]*(\S+)[ \t]*$"), None, 1),
+    Regra("String de conexão com senha", "credencial", _f(r"\b[a-z][a-z0-9+.-]*://[^:\s/]+:([^@\s]+)@"), None, 1),
+    Regra("Usuário de sistema", "credencial", _f(r"\b(?:user|usu[áa]rio|login|username)\s*[:=]\s*([^\s,;]+)"), None, 1),
+    Regra("IP interno de servidor", "infraestrutura", re.compile(
+        r"\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b")),
+    Regra("Cartão de crédito", "financeiro", re.compile(r"(?<![\d.\-/])((?:\d[ \-]?){12,18}\d)(?![\d.\-/])"), _cartao_valido, 1),
     Regra("Criança/adolescente", "crianca", _f(r"\b(?:menor de idade|crian[çc]a|adolescente|rec[ée]m-nascid[oa]|ECA\b|tutelad[oa]|guarda (?:provis[óo]ria|definitiva))")),
 )
+
+
+TIPOS_OCULTOS = {r.tipo for r in REGRAS if r.categoria in {"credencial", "sensivel"}} | {"Senha em texto puro"}
 
 
 def mascarar(tipo: str, valor: str) -> str:
@@ -89,6 +117,10 @@ def mascarar(tipo: str, valor: str) -> str:
         return f"***.{d[3:6]}.{d[6:9]}-**"
     if tipo == "CNPJ":
         return v.formatar_cnpj(valor)  # CNPJ é público
+    if tipo == "Cartão de crédito":
+        return f"**** **** **** {d[-4:]}"
+    if tipo in TIPOS_OCULTOS:
+        return "[oculto]"
     if tipo == "E-mail" and "@" in valor:
         usuario, dominio = valor.split("@", 1)
         return f"{usuario[:2]}***@{dominio}"
@@ -97,22 +129,32 @@ def mascarar(tipo: str, valor: str) -> str:
     return valor[:2] + "*" * (len(valor) - 4) + valor[-2:]
 
 
-def _contexto(texto: str, inicio: int, fim: int, tipo: str, valor: str) -> str:
-    """Trecho ao redor do achado, ele próprio anonimizado (não pode vazar dados vizinhos)."""
-    trecho = texto[max(0, inicio - 60): fim + 60].replace("\n", " ")
-    palavras = trecho.split(" ")
-    if inicio > 60 and len(palavras) > 2:
-        palavras = palavras[1:]  # descarta palavra cortada no início
-    if fim + 60 < len(texto) and len(palavras) > 2:
-        palavras = palavras[:-1]
-    trecho = anonimizar_texto(" ".join(palavras))
-    return re.sub(r"\d[\d.\-/ ]{4,}\d", lambda m: "#" * len(m.group()), trecho)
+def _contexto(linhas_originais: list[str], linhas_anonimas: list[str], inicio: int, conteudo: str) -> str:
+    """Linha onde está o achado, tirada do texto JÁ anonimizado por inteiro.
+
+    Anonimizar a página toda antes de recortar garante que nenhum dado vizinho vaze
+    (regras que dependem da linha inteira, como "admin / senha", continuam funcionando).
+    """
+    n = conteudo.count("\n", 0, inicio)
+    if len(linhas_anonimas) == len(linhas_originais):
+        linha = linhas_anonimas[n]
+    else:  # alguma regra juntou linhas: anonimiza só a linha do achado
+        linha = anonimizar_texto(linhas_originais[n])
+    if len(linha) > 200:
+        posicao = inicio - (conteudo.rfind("\n", 0, inicio) + 1)
+        centro = int(posicao / max(len(linhas_originais[n]), 1) * len(linha))
+        linha = linha[max(0, centro - 100): centro + 100]
+        linha = " ".join(linha.split(" ")[1:-1]) or linha
+    linha = re.sub(r"\d[\d.\-/ ]{4,}\d", lambda m: "#" * len(m.group()), linha.strip())
+    return linha
 
 
 def encontrar_em_texto(texto: str, documento: str, paginas: list[str] | None = None) -> list[dict]:
     paginas = paginas or [texto]
     achados, vistos = [], set()
     for numero_pagina, conteudo in enumerate(paginas, start=1):
+        linhas_originais = conteudo.split("\n")
+        linhas_anonimas = anonimizar_texto(conteudo).split("\n")
         for regra in REGRAS:
             for m in regra.padrao.finditer(conteudo):
                 valor = m.group(regra.grupo).strip()
@@ -129,8 +171,8 @@ def encontrar_em_texto(texto: str, documento: str, paginas: list[str] | None = N
                     "pagina_ou_coluna": numero_pagina,
                     "tipo": regra.tipo,
                     "categoria": regra.categoria,
-                    "valor_mascarado": mascarar(regra.tipo, valor) if regra.categoria != "sensivel" else "[oculto]",
-                    "contexto": _contexto(conteudo, m.start(), m.end(), regra.tipo, valor),
+                    "valor_mascarado": mascarar(regra.tipo, valor),
+                    "contexto": _contexto(linhas_originais, linhas_anonimas, m.start(), conteudo),
                     "_valor": valor,
                 })
     return achados
@@ -145,6 +187,8 @@ def anonimizar_texto(texto: str) -> str:
 
         def trocar(m, regra=regra):
             valor = m.group(regra.grupo)
+            if valor.startswith("["):  # já anonimizado por outra regra
+                return m.group(0)
             if regra.validar and not regra.validar(valor):
                 return m.group(0)
             if regra.tipo == "Telefone" and len(v.somente_digitos(valor)) < 10:
@@ -178,7 +222,16 @@ COLUNAS_SENSIVEIS = {
 }
 
 
+COLUNAS_CREDENCIAIS = {"senha", "password", "pass", "pwd", "passwd", "senha_acesso", "token", "api_key", "secret", "hash_senha"}
+COLUNAS_CARTAO = {"cartao", "card", "numero_cartao", "cartao_credito", "cc", "num_cartao", "credit_card"}
+
+
 def _classificar_coluna(coluna: str, tipo: str) -> tuple[str, str] | None:
+    base = re.sub(r"_\d+$", "", coluna)
+    if base in COLUNAS_CREDENCIAIS:
+        return "Senha em texto puro", "credencial"
+    if base in COLUNAS_CARTAO:
+        return "Cartão de crédito", "financeiro"
     if tipo == "cpf":
         return "CPF", "pessoal"
     if tipo == "cpf_cnpj":
@@ -209,8 +262,8 @@ def encontrar_em_tabela(nome_tabela: str, df: pd.DataFrame, tipos: dict[str, str
         if classe is None and tipos.get(coluna) == "texto":
             # Conteúdo: e-mails/telefones/CPFs soltos em colunas de texto livre.
             amostra = df[coluna].dropna().astype(str).head(200)
-            for regra in REGRAS[:15]:
-                if regra.categoria == "empresa":
+            for regra in REGRAS:
+                if regra.categoria not in {"pessoal", "financeiro", "credencial"} or regra.tipo in {"Nome de pessoa", "Endereço"}:
                     continue
                 hits = amostra.map(lambda x: any(
                     (not regra.validar or regra.validar(m.group(regra.grupo))) for m in regra.padrao.finditer(x)
@@ -242,14 +295,15 @@ def anonimizar_tabela(df: pd.DataFrame, achados_tabela: list[dict]) -> pd.DataFr
         coluna = achado["pagina_ou_coluna"]
         if coluna not in saida.columns:
             continue
-        if achado["categoria"] == "sensivel":
+        if achado["categoria"] in {"sensivel", "credencial"}:
             saida = saida.drop(columns=[coluna])
         elif achado["tipo"] == "nome":
             saida[coluna] = saida[coluna].map(
                 lambda x: None if pd.isna(x) else " ".join(p[0] + "." for p in str(x).split()))
         elif achado["tipo"] == "nascimento":
             # Mantém só o ano: preserva análises por faixa etária sem identificar a pessoa.
-            saida[coluna] = pd.to_datetime(saida[coluna], errors="coerce").dt.year.astype("Int64")
+            saida[coluna] = saida[coluna].map(lambda x: (v.interpretar_data(x)[0] or x).year if hasattr(
+                v.interpretar_data(x)[0] or x, "year") else None).astype("Int64")
         elif achado["tipo"] == "CEP":
             saida[coluna] = saida[coluna].map(lambda x: None if pd.isna(x) else str(x)[:5] + "-***")
         else:
@@ -260,7 +314,9 @@ def anonimizar_tabela(df: pd.DataFrame, achados_tabela: list[dict]) -> pd.DataFr
 
 def nivel_de_risco(achados: list[dict]) -> str:
     categorias = {a["categoria"] for a in achados}
-    if "sensivel" in categorias or "crianca" in categorias:
+    if categorias & {"credencial", "financeiro"}:
+        return "CRÍTICO"
+    if categorias & {"sensivel", "crianca", "infraestrutura"}:
         return "ALTO"
     if "pessoal" in categorias:
         return "MÉDIO"
