@@ -12,7 +12,12 @@ def main():
     parser.add_argument("-o", "--saida", default="resultado_organizado.xlsx")
     parser.add_argument("--ia", action="store_true", help="Usar Claude para entender colunas e redigir parecer")
     parser.add_argument("--chave", help="Forçar a chave de cruzamento (ex.: cpf, cnpj, codigo_ibge, matricula)")
+    parser.add_argument("--api-url", help="Endereço de um gateway compatível com a API da Anthropic (ex.: https://servidor/v1). "
+                                          "A chave vem da variável ANTHROPIC_API_KEY.")
     args = parser.parse_args()
+    if args.api_url:
+        import os
+        os.environ["AGENTE_API_URL"] = args.api_url
 
     arquivos = []
     for a in args.arquivos:

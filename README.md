@@ -68,6 +68,16 @@ export ANTHROPIC_API_KEY="sua-chave"
 
 Sem a chave, tudo funciona com as regras automáticas. Modelo padrão: `claude-opus-5-5` (troque com `AGENTE_MODELO`).
 
+**Usando um gateway/servidor próprio compatível com a API da Anthropic:**
+
+```bash
+export AGENTE_API_URL="https://seu-gateway/v1"      # Windows: set AGENTE_API_URL=https://seu-gateway/v1
+export ANTHROPIC_API_KEY="chave-do-gateway"
+python -m agente pasta.zip --ia -o resultado.xlsx    # ou --api-url https://seu-gateway/v1
+```
+
+Na tela web (`streamlit run app.py`) há os campos **Endereço da API** e **Chave da API** na barra lateral. Com gateway, o agente usa um "modo compatível" (sem recursos beta; JSON pedido no texto). Atenção: o gateway recebe o que é enviado à IA — o agente já manda tudo anonimizado, mas use apenas serviços em que você confia.
+
 **Privacidade (LGPD):** a IA **nunca recebe dados pessoais em claro**. Das tabelas vão só os nomes das colunas e até 5 exemplos por coluna com números longos mascarados (`###`); dos documentos vai o texto **já anonimizado** (`[CPF]`, `[NOME DE PESSOA]`...); para o parecer, apenas estatísticas agregadas.
 
 **Limitações:** PDFs digitalizados (imagem) precisam de OCR antes — o agente avisa quando encontra um. A detecção de nomes depende de contexto ("Sr.", "representada por", "beneficiária", "Nome:"); nomes soltos no meio do texto podem escapar, então revise documentos de risco ALTO antes de publicar.

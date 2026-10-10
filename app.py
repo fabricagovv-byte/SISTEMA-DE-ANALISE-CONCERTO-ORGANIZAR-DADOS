@@ -3,10 +3,12 @@
 Executar:  streamlit run app.py
 """
 
+import os
+
 import streamlit as st
 
 from agente import executar, gerar_excel, gerar_pacote_zip
-from agente.agente_ia import ia_disponivel
+from agente.agente_ia import endereco_api, ia_disponivel, usa_gateway
 from agente.pipeline import _sem_segredos
 
 st.set_page_config(page_title="Agente de Dados do Governo", page_icon="🏛️", layout="wide")
@@ -19,6 +21,19 @@ st.caption(
 
 with st.sidebar:
     st.header("Configurações")
+    with st.expander("🔑 Conexão com a IA", expanded=not ia_disponivel()):
+        url = st.text_input("Endereço da API (opcional)", value=os.environ.get("AGENTE_API_URL", ""),
+                            placeholder="vazio = api.anthropic.com · ex.: https://meu-gateway/v1")
+        chave_api = st.text_input("Chave da API", type="password", placeholder="sk-...",
+                                  help="Fica só na memória deste servidor enquanto ele roda; não é gravada em arquivo.")
+        if url.strip():
+            os.environ["AGENTE_API_URL"] = url.strip()
+        else:
+            os.environ.pop("AGENTE_API_URL", None)
+        if chave_api.strip():
+            os.environ["ANTHROPIC_API_KEY"] = chave_api.strip()
+        if usa_gateway():
+            st.caption(f"Usando gateway: {endereco_api()} (modo compatível). Os dados enviados já vão anonimizados.")
     tem_ia = ia_disponivel()
     usar_ia = st.toggle(
         "Usar IA (Claude) para entender colunas e redigir parecer",

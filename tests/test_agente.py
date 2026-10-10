@@ -185,3 +185,42 @@ def test_pipeline_completo_com_documentos():
         assert any(n.startswith("anonimizado/documentos/") for n in nomes)
         oficio = z.read("anonimizado/documentos/oficio_atendimento_social.txt").decode()
         assert "[CPF]" in oficio and "Francisca" not in oficio
+
+
+def test_gateway_compativel(monkeypatch):
+    from agente import agente_ia
+
+    monkeypatch.setenv("AGENTE_API_URL", "iron-exemplo.fly.dev/v1")
+    assert agente_ia.endereco_api() == "https://iron-exemplo.fly.dev"
+    assert agente_ia.usa_gateway()
+    monkeypatch.setenv("AGENTE_API_URL", "https://api.anthropic.com")
+    assert not agente_ia.usa_gateway()
+    assert agente_ia._extrair_json('Claro! ```json\n{"a": "x}", "b": [1, {"c": 2}]}\n``` fim') == '{"a": "x}", "b": [1, {"c": 2}]}'
+
+
+def test_gateway_mapeia_colunas_e_nao_envia_dados_pessoais(monkeypatch):
+    from types import SimpleNamespace
+
+    from agente import agente_ia
+
+    enviados = []
+
+    class Stream:
+        def __init__(self, **kw):
+            enviados.append(kw)
+            assert "betas" not in kw and "fallbacks" not in kw  # modo compatível
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def get_final_message(self):
+            texto = '{"tabelas": [{"tabela": "t", "descricao": "d", "colunas": [{"original": "NR_CPF", "nome_padronizado": "cpf", "tipo": "cpf"}]}]}'
+            return SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=texto)])
+
+    monkeypatch.setenv("AGENTE_API_URL", "https://gateway.exemplo/v1")
+    monkeypatch.setattr(agente_ia, "_cliente", lambda: SimpleNamespace(messages=SimpleNamespace(stream=Stream)))
+    df = pd.DataFrame({"NR_CPF": ["529.982.247-25"], "EMAIL": ["maria@exemplo.com"]})
+    resultado = agente_ia.mapear_colunas({"t": df})
+    assert resultado["tabelas"][0]["colunas"][0]["nome_padronizado"] == "cpf"
+    conteudo = enviados[0]["messages"][0]["content"]
+    assert "529.982.247-25" not in conteudo and "maria@" not in conteudo

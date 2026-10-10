@@ -57,6 +57,32 @@ ESQUEMA_MAPEAMENTO = {
 }
 
 
+def endereco_api() -> str | None:
+    """Servidor da API: o oficial da Anthropic ou um gateway compatível (AGENTE_API_URL).
+
+    Aceita 'https://servidor/v1', 'https://servidor' ou só 'servidor' — o SDK acrescenta /v1/messages.
+    """
+    url = (os.environ.get("AGENTE_API_URL") or os.environ.get("ANTHROPIC_BASE_URL") or "").strip()
+    if not url:
+        return None
+    if not re.match(r"https?://", url):
+        url = "https://" + url.lstrip("/")
+    url = re.sub(r"/v1/?$", "", url.rstrip("/"))
+    return url
+
+
+def usa_gateway() -> bool:
+    url = endereco_api()
+    return bool(url) and "api.anthropic.com" not in url
+
+
+def _cliente():
+    import anthropic
+
+    url = endereco_api()
+    return anthropic.Anthropic(base_url=url) if url else anthropic.Anthropic()
+
+
 def ia_disponivel() -> bool:
     try:
         import anthropic  # noqa: F401
@@ -93,7 +119,54 @@ def _descrever(tabelas_brutas: dict[str, pd.DataFrame]) -> str:
     return json.dumps(partes, ensure_ascii=False, indent=1)
 
 
+def _extrair_json(texto: str) -> str:
+    """Pega o primeiro objeto JSON da resposta (gateways sem saída estruturada)."""
+    texto = re.sub(r"^```(?:json)?\s*|\s*```$", "", texto.strip())
+    inicio = texto.find("{")
+    if inicio < 0:
+        raise ValueError("a IA não devolveu JSON")
+    profundidade, aspas, escape = 0, False, False
+    for i, c in enumerate(texto[inicio:], start=inicio):
+        if aspas:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                aspas = False
+            continue
+        if c == '"':
+            aspas = True
+        elif c == "{":
+            profundidade += 1
+        elif c == "}":
+            profundidade -= 1
+            if profundidade == 0:
+                return texto[inicio:i + 1]
+    raise ValueError("JSON incompleto na resposta da IA")
+
+
+def _chamar_compativel(cliente, mensagem: str, esquema: dict | None) -> str:
+    """Pedido mínimo, aceito pela maioria dos gateways compatíveis com a API da Anthropic."""
+    if esquema:
+        mensagem += ("\n\nResponda SOMENTE com um objeto JSON válido (sem texto antes ou depois) "
+                     f"que siga exatamente este JSON Schema:\n{json.dumps(esquema, ensure_ascii=False)}")
+    with cliente.messages.stream(
+        model=MODELO,
+        max_tokens=16000,
+        system=SISTEMA,
+        messages=[{"role": "user", "content": mensagem}],
+    ) as stream:
+        resposta = stream.get_final_message()
+    if resposta.stop_reason == "refusal":
+        raise RuntimeError("A IA recusou a solicitação.")
+    texto = "".join(getattr(b, "text", "") for b in resposta.content if getattr(b, "type", "") == "text")
+    return _extrair_json(texto) if esquema else texto
+
+
 def _chamar(cliente, mensagem: str, esquema: dict | None = None, esforco: str = "medium") -> str:
+    if usa_gateway():
+        return _chamar_compativel(cliente, mensagem, esquema)
     output_config: dict = {"effort": esforco}
     if esquema:
         output_config["format"] = {"type": "json_schema", "schema": esquema}
@@ -123,7 +196,7 @@ def mapear_colunas(tabelas_brutas: dict[str, pd.DataFrame]) -> dict:
     """
     import anthropic
 
-    cliente = anthropic.Anthropic()
+    cliente = _cliente()
     mensagem = (
         "Recebi as tabelas abaixo (nomes de colunas e exemplos já anonimizados; '#' são dígitos ocultos).\n"
         "Para CADA coluna de CADA tabela:\n"
@@ -159,7 +232,7 @@ def redigir_parecer(resumo: dict) -> str:
     """Gera um parecer executivo em Markdown a partir das estatísticas (sem dados pessoais)."""
     import anthropic
 
-    cliente = anthropic.Anthropic()
+    cliente = _cliente()
     mensagem = (
         "Com base nas estatísticas abaixo de um processamento de bases de dados governamentais, "
         "escreva um parecer técnico em Markdown com: (1) visão geral das bases, (2) qualidade dos dados "
@@ -197,7 +270,7 @@ def analisar_documento(nome: str, texto_anonimizado: str, tipos_validos: list[st
 
     truncado = len(texto_anonimizado) > LIMITE_CARACTERES_DOCUMENTO
     texto = texto_anonimizado[:LIMITE_CARACTERES_DOCUMENTO]
-    cliente = anthropic.Anthropic()
+    cliente = _cliente()
     mensagem = (
         f"Documento público '{nome}' (dados pessoais já substituídos por marcadores como [CPF]).\n"
         f"1. tipo: escolha um de {tipos_validos} ou 'Outro'.\n"
