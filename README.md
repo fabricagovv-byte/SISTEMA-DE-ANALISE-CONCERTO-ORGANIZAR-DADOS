@@ -41,6 +41,8 @@ Você sobe **documentos públicos** (PDF, Word, HTML, TXT, RTF) e **bases de dad
 
 ## Como usar
 
+**Jeito mais fácil:** dê dois cliques em `iniciar.bat` (Windows) ou rode `./iniciar.sh` (Linux/Mac). Ele instala o que falta, pede a chave da IA (já configurado para o servidor `iron-cody-api.fly.dev`) e abre a tela no navegador. A chave não é gravada em arquivo.
+
 ```bash
 pip install -r requirements.txt
 
